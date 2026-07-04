@@ -36,6 +36,7 @@
 #include <ESPmDNS.h>
 #include <deque>
 #include <algorithm>
+#include <vector>
 
 #include "AudioWhisper.h"
 #include "Whisper.h"
@@ -206,6 +207,9 @@ void loadConfigFromNvs() {
   wake_enable = nvs_get_u8_or("chibi", "wake_en", 1) != 0;
   String v = nvs_get_string("chibi", "vad");
   if (v != "") vad_threshold = constrain(v.toInt(), 200, 8000);
+  // NOTE: この基板では Serial(HWCDC) の出力がUSBに届かないため printf(IDFコンソール)を使う
+  printf("[WAKE] 呼びかけ起動=%s / 有効ワード=[%s] / VADしきい値=%d\n",
+         wake_enable ? "ON" : "OFF", WAKE_PHRASE.c_str(), vad_threshold);
 
   String place = nvs_get_string("chibi", "place");
   if (place != "") WEATHER_PLACE = place;
@@ -973,20 +977,73 @@ void Wifi_setup() {
 // ====================================================================
 //  音声認識 (Whisper) と呼びかけ判定
 // ====================================================================
-// 録音中は背景を緑にして「聞いている」ことを画面で示す
-void showListening(bool on) {
+// ==== 呼びかけ語頭欠け対策: トリガ前 0.5 秒のプリロールバッファ ====
+// VAD監視中の20msチャンクを常にリングバッファへ保存し、録音の先頭に前置する。
+constexpr int  kVadChunkSamples = 320;  // 20ms @ 16kHz (vad_triggered と共通)
+constexpr int  kPreRollChunks   = 50;   // 50 x 20ms = 1.0s (トリガ確認が遅れても語頭を保護)
+static int16_t vad_history[kPreRollChunks * kVadChunkSamples];
+static int     vad_hist_pos = 0;    // 次に書き込むチャンク番号
+static int     vad_hist_count = 0;  // 有効チャンク数
+
+// 履歴を古い順に out へ並べ、サンプル数を返す
+static size_t vadHistoryCopy(int16_t* out) {
+  int start = (vad_hist_pos - vad_hist_count + kPreRollChunks) % kPreRollChunks;
+  for (int i = 0; i < vad_hist_count; i++) {
+    int idx = (start + i) % kPreRollChunks;
+    memcpy(&out[i * kVadChunkSamples], &vad_history[idx * kVadChunkSamples],
+           kVadChunkSamples * sizeof(int16_t));
+  }
+  return (size_t)vad_hist_count * kVadChunkSamples;
+}
+
+// 背景色で状態を見せる: 緑=録音中(聞いている) / 紺=認識・考え中 / 黒=待機
+enum FaceState { FACE_IDLE, FACE_LISTENING, FACE_THINKING };
+void showFaceState(FaceState s) {
   ColorPalette cp;  // デフォルトは黒背景
-  if (on) cp.set(COLOR_BACKGROUND, TFT_DARKGREEN);
+  if (s == FACE_LISTENING)      cp.set(COLOR_BACKGROUND, TFT_DARKGREEN);
+  else if (s == FACE_THINKING)  cp.set(COLOR_BACKGROUND, M5.Lcd.color565(0, 0, 96));
   avatar.setColorPalette(cp);
 }
 
-String SpeechToText() {
-  Serial.println("\r\nRecord start!\r\n");
-  showListening(true);
+String SpeechToText(bool use_preroll = false) {
+  printf("Record start!%s\n", use_preroll ? " (プリロール付き)" : "");
+  showFaceState(FACE_LISTENING);
   AudioWhisper* audio = new AudioWhisper();
-  audio->Record();
-  showListening(false);
-  Serial.println("Record end. transcribing...");
+  size_t pre_n = 0;
+  if (use_preroll && vad_hist_count > 0) {
+    static int16_t preroll_copy[kPreRollChunks * kVadChunkSamples];
+    pre_n = vadHistoryCopy(preroll_copy);
+    audio->Record(preroll_copy, pre_n, vad_threshold);
+  } else {
+    audio->Record(nullptr, 0, vad_threshold);
+  }
+  showFaceState(FACE_THINKING);
+  // デバッグ: 録音データの振幅を区間別に確認 (無音WAVをWhisperに送っていないか)
+  {
+    const int16_t* wav = (const int16_t*)(audio->GetBuffer() + 44);
+    const size_t total = (audio->GetSize() - 44) / 2;
+    int prePeak = 0, livePeak = 0;
+    for (size_t i = 0; i < total; i++) {
+      int v = abs((int)wav[i]);
+      if (i < pre_n) { if (v > prePeak) prePeak = v; }
+      else           { if (v > livePeak) livePeak = v; }
+    }
+    printf("[REC] total=%u pre=%u prePeak=%d livePeak=%d\n",
+           (unsigned)total, (unsigned)pre_n, prePeak, livePeak);
+    // 100msごとのピーク一覧 (声がどの時間帯にあるか)
+    printf("[WAVPROF]");
+    for (size_t b = 0; b < total; b += 1600) {
+      const size_t e = (b + 1600 < total) ? b + 1600 : total;
+      int peak = 0;
+      for (size_t i = b; i < e; i++) {
+        int v = abs((int)wav[i]);
+        if (v > peak) peak = v;
+      }
+      printf(" %d", peak);
+    }
+    printf("\n");
+  }
+  printf("Record end. transcribing...\n");
   avatar.setExpression(Expression::Doubt);  // 認識中
   Whisper* stt = new Whisper(root_ca_openai, OPENAI_API_KEY.c_str());
   String ret = stt->Transcribe(audio);
@@ -1005,6 +1062,9 @@ bool isWhisperHallucination(const String& textIn) {
     "ご視聴",
     "ご清聴",
     "視聴ありがと",
+    "視聴してくださ",
+    "ご覧いただき",
+    "字幕",
     "チャンネル登録",
     "高評価",
     "最後までご覧",
@@ -1019,9 +1079,86 @@ bool isWhisperHallucination(const String& textIn) {
   return false;
 }
 
+// 長音・波線・空白を取り除いた正規化文字列を作る。
+// map に「正規化後のバイト位置 -> 元のバイト位置」の対応を入れる (不要なら nullptr)。
+// Whisper の認識ゆれ (「スタックちゃーん」等) を吸収するため。
+static String normalizeForWake(const String& in, std::vector<int>* map) {
+  String out;
+  int i = 0;
+  const int n = in.length();
+  while (i < n) {
+    uint8_t c = in[i];
+    int len = (c < 0x80) ? 1 : (c < 0xE0) ? 2 : (c < 0xF0) ? 3 : 4;
+    if (i + len > n) len = n - i;
+    String ch = in.substring(i, i + len);
+    if (ch != "ー" && ch != "〜" && ch != "～" && ch != " " && ch != "　") {
+      if (map) {
+        for (int k = 0; k < len; k++) map->push_back(i + k);
+      }
+      out += ch;
+    }
+    i += len;
+  }
+  return out;
+}
+
+// UTF-8 文字列を1文字ずつに分解し、各文字の開始バイト位置も返す
+static void splitUtf8(const String& s, std::vector<String>* chars, std::vector<int>* offs) {
+  int i = 0;
+  const int n = s.length();
+  while (i < n) {
+    uint8_t c = s[i];
+    int len = (c < 0x80) ? 1 : (c < 0xE0) ? 2 : (c < 0xF0) ? 3 : 4;
+    if (i + len > n) len = n - i;
+    chars->push_back(s.substring(i, i + len));
+    offs->push_back(i);
+    i += len;
+  }
+}
+
+// パターン P がテキスト T のどこかの部分文字列に編集距離 maxDist 以内で一致するか。
+// 一致したら文字単位の範囲 [startCp, endCp) を返す。(部分文字列マッチ用DP)
+static bool fuzzyFind(const std::vector<String>& T, const std::vector<String>& P,
+                      int maxDist, int* startCp, int* endCp) {
+  const int n = T.size(), m = P.size();
+  if (m == 0 || n == 0) return false;
+  std::vector<std::vector<int>> D(m + 1, std::vector<int>(n + 1));
+  std::vector<std::vector<int>> S(m + 1, std::vector<int>(n + 1));  // 一致開始位置
+  for (int j = 0; j <= n; j++) { D[0][j] = 0; S[0][j] = j; }
+  for (int i = 1; i <= m; i++) { D[i][0] = i; S[i][0] = 0; }
+  for (int i = 1; i <= m; i++) {
+    for (int j = 1; j <= n; j++) {
+      const int sub = D[i-1][j-1] + (P[i-1] == T[j-1] ? 0 : 1);  // 置換/一致
+      const int del = D[i-1][j] + 1;                              // 聞き落とし
+      const int ins = D[i][j-1] + 1;                              // 余分な文字
+      int best = sub, src = 1;
+      if (del < best) { best = del; src = 2; }
+      if (ins < best) { best = ins; src = 3; }
+      D[i][j] = best;
+      S[i][j] = (src == 1) ? S[i-1][j-1] : (src == 2) ? S[i-1][j] : S[i][j-1];
+    }
+  }
+  int bestJ = -1, bestD = maxDist + 1;
+  for (int j = 1; j <= n; j++) {
+    if (D[m][j] < bestD) { bestD = D[m][j]; bestJ = j; }
+  }
+  if (bestJ < 0) return false;
+  *startCp = S[m][bestJ];
+  *endCp = bestJ;
+  return true;
+}
+
 // 認識テキストから呼びかけワードを探す。見つかったら開始位置を返し、
 // matchLen にワード長を入れる。カンマ/読点区切りで複数登録可。
+// 長音「ー」や空白の有無は無視。5文字以上のワードは1文字までの
+// 聞き違い (「スタッフちゃん」等) も許容する。
 int findWakePhrase(const String& text, int* matchLen) {
+  std::vector<int> map;
+  String normText = normalizeForWake(text, &map);
+  std::vector<String> tcp;
+  std::vector<int> toffs;
+  splitUtf8(normText, &tcp, &toffs);
+
   String phrases = WAKE_PHRASE;
   phrases.replace("、", ",");
   int from = 0;
@@ -1030,11 +1167,20 @@ int findWakePhrase(const String& text, int* matchLen) {
     if (comma < 0) comma = phrases.length();
     String p = phrases.substring(from, comma);
     p.trim();
+    p = normalizeForWake(p, nullptr);
     if (p.length() > 0) {
-      int idx = text.indexOf(p);
-      if (idx >= 0) {
-        *matchLen = p.length();
-        return idx;
+      std::vector<String> pcp;
+      std::vector<int> poffs;
+      splitUtf8(p, &pcp, &poffs);
+      const int maxDist = (pcp.size() >= 5) ? 1 : 0;  // 短いワードは完全一致のみ
+      int scp = 0, ecp = 0;
+      if (fuzzyFind(tcp, pcp, maxDist, &scp, &ecp)) {
+        const int nStart = toffs[scp];
+        const int nEnd = (ecp < (int)toffs.size()) ? toffs[ecp] : (int)normText.length();
+        const int start = map[nStart];
+        const int end = (nEnd < (int)map.size()) ? map[nEnd] : (int)text.length();
+        *matchLen = end - start;
+        return start;
       }
     }
     from = comma + 1;
@@ -1075,10 +1221,13 @@ void sw_tone() {
 void listen_and_chat(bool require_wake) {
   head::center();
   avatar.setExpression(Expression::Happy);  // 聞いてます
-  String ret = SpeechToText();
+  // 呼びかけ起動時はトリガ前0.5秒を録音に前置して語頭欠けを防ぐ
+  String ret = SpeechToText(require_wake);
 
   if (ret == "" || isWhisperHallucination(ret)) {
-    if (ret != "") Serial.printf("音声認識: 幻聴とみなし無視 [%s]\n", ret.c_str());
+    if (ret != "") printf("音声認識: 幻聴とみなし無視 [%s]\n", ret.c_str());
+    else printf("音声認識: 空文字 (無音/認識失敗)\n");
+    showFaceState(FACE_IDLE);
     if (!require_wake) {  // ボタン起動のときだけ「聞き取れなかった」表現
       avatar.setExpression(Expression::Sad);
       delay(1500);
@@ -1086,28 +1235,32 @@ void listen_and_chat(bool require_wake) {
     }
     return;
   }
-  Serial.println("音声認識結果: " + ret);
+  printf("音声認識結果: %s\n", ret.c_str());
 
   if (require_wake) {
     int matchLen = 0;
     int idx = findWakePhrase(ret, &matchLen);
     if (idx < 0) {
-      Serial.println("呼びかけワードなし -> 無視");
+      printf("呼びかけワードなし -> 無視 (有効ワード: [%s])\n", WAKE_PHRASE.c_str());
+      showFaceState(FACE_IDLE);
       return;
     }
+    printf("呼びかけ検出: [%s]\n", ret.substring(idx, idx + matchLen).c_str());
     String rest = stripLeadingPunct(ret.substring(idx + matchLen));
     if (rest.length() < 6) {  // 呼びかけのみ (日本語2文字未満) -> 聞き返す
       g_reply_expression = Expression::Happy;
       avatar.setExpression(Expression::Happy);
+      showFaceState(FACE_IDLE);
       speakBlocking("なあに？");
       ret = SpeechToText();
       if (ret == "" || isWhisperHallucination(ret)) {
+        showFaceState(FACE_IDLE);
         avatar.setExpression(Expression::Sad);
         delay(1500);
         avatar.setExpression(Expression::Neutral);
         return;
       }
-      Serial.println("音声認識結果(2): " + ret);
+      printf("音声認識結果(2): %s\n", ret.c_str());
     } else {
       ret = rest;
     }
@@ -1120,13 +1273,36 @@ void listen_and_chat(bool require_wake) {
 
 // アイドル時の音量トリガ (声がしたら true)
 bool vad_triggered() {
-  static int hot = 0;
+  // 直近25チャンク(0.5秒)のうち「大きい音」が8チャンク(0.16秒)以上あればトリガ。
+  // 連続カウント方式だと「ス・タッ・ク」のような細切れの単語が弾かれるため窓方式。
+  // 一瞬で減衰するノック音等は窓内で2〜4チャンクにしかならず弾かれる。
+  constexpr int kWinChunks = 25;
+  constexpr int kLoudNeeded = 8;
+  static bool recent[kWinChunks] = {};
+  static int  rpos = 0;
+  static int  loud_cnt = 0;
+  static int warmup = 40;   // マイク起動直後に捨てるチャンク数 (40 x 20ms = 0.8s)
   static int16_t buf[320];  // 20ms @ 16kHz
-  if (!M5.Mic.isEnabled()) {
+  // 注意: isEnabled() はピン設定の有無を返すだけで動作状態を反映しない。
+  // 録音/再生後のマイク再始動を検知するには isRunning() を使う。
+  if (!M5.Mic.isRunning()) {
     M5.Mic.begin();
+    vad_hist_pos = 0;
+    vad_hist_count = 0;  // 再生直後などの古い履歴を捨てる
+    memset(recent, 0, sizeof(recent));
+    loud_cnt = 0;
+    warmup = 40;  // ES8311再起動直後はフルスケールのノイズが出るため0.8秒捨てる
     return false;
   }
   if (!M5.Mic.record(buf, 320, 16000)) return false;
+  if (warmup > 0) {
+    warmup--;
+    return false;  // ウォームアップ中は履歴にもVAD評価にも使わない
+  }
+  // プリロール履歴へ保存 (トリガ時に録音の先頭へ前置される)
+  memcpy(&vad_history[vad_hist_pos * kVadChunkSamples], buf, sizeof(buf));
+  vad_hist_pos = (vad_hist_pos + 1) % kPreRollChunks;
+  if (vad_hist_count < kPreRollChunks) vad_hist_count++;
   int peak = 0;
   for (int i = 0; i < 320; i++) {
     int v = abs(buf[i]);
@@ -1137,17 +1313,17 @@ bool vad_triggered() {
   static uint32_t log_at = 0;
   if (peak > log_peak) log_peak = peak;
   if (millis() - log_at >= 1000) {
-    Serial.printf("[VAD] peak=%d (threshold=%d)\n", log_peak, vad_threshold);
+    printf("[VAD] peak=%d (threshold=%d)\n", log_peak, vad_threshold);
     log_peak = 0;
     log_at = millis();
   }
-  if (peak >= vad_threshold) {
-    hot++;
-  } else if (hot > 0) {
-    hot--;
-  }
-  if (hot >= 3) {
-    hot = 0;
+  const bool is_loud = (peak >= vad_threshold);
+  loud_cnt += (is_loud ? 1 : 0) - (recent[rpos] ? 1 : 0);
+  recent[rpos] = is_loud;
+  rpos = (rpos + 1) % kWinChunks;
+  if (loud_cnt >= kLoudNeeded) {
+    memset(recent, 0, sizeof(recent));
+    loud_cnt = 0;
     return true;
   }
   return false;
@@ -1179,6 +1355,7 @@ void setup() {
     uint8_t micgain = nvs_get_u8_or("setting", "micgain", 0);
     if (micgain > 0) micConfig.magnification = micgain;
     M5.Mic.config(micConfig);
+    printf("[MIC] magnification=%d\n", micConfig.magnification);
   }
   M5.Mic.begin();
 
@@ -1270,7 +1447,11 @@ void setup() {
 
   // 起動あいさつ (スピーカー/鍵の動作確認を兼ねる)
   g_reply_expression = Expression::Happy;
-  speech_text = "こんにちは、ちびスタックちゃんだよ。「" + WAKE_PHRASE.substring(0, WAKE_PHRASE.indexOf(',') > 0 ? WAKE_PHRASE.indexOf(',') : WAKE_PHRASE.length()) + "」って呼んでね。";
+  String first_wake = WAKE_PHRASE;
+  first_wake.replace("、", ",");  // 読点区切りにも対応して最初の1語だけ読む
+  if (first_wake.indexOf(',') > 0) first_wake = first_wake.substring(0, first_wake.indexOf(','));
+  first_wake.trim();
+  speech_text = "こんにちは、ちびスタックちゃんだよ。「" + first_wake + "」って呼んでね。";
 }
 
 void loop() {
@@ -1290,6 +1471,7 @@ void loop() {
 
   // 返答があれば読み上げ開始
   if (speech_text != "") {
+    showFaceState(FACE_IDLE);
     avatar.setExpression(g_reply_expression);
     speech_text_buffer = speech_text;
     speech_text = "";
@@ -1301,12 +1483,13 @@ void loop() {
   if (mp3->isRunning()) {
     if (!mp3->loop()) {
       stopPlayback();
-      Serial.println("mp3 stop");
+      printf("mp3 stop\n");
       avatar.setExpression(Expression::Neutral);
       speech_text_buffer = "";
       delay(200);
       M5.Speaker.end();
-      M5.Mic.begin();
+      // マイク再開はここでは行わない: vad_triggered() が isRunning() を見て
+      // 履歴リセット+ウォームアップ付きで再開する
     }
     delay(1);
   } else {
@@ -1314,7 +1497,7 @@ void loop() {
     // 呼びかけ待ち: 音量トリガ -> Whisper -> 呼びかけワード照合
     if (wake_enable && speech_text == "" && speech_text_buffer == "") {
       if (vad_triggered()) {
-        Serial.println("[VAD] triggered");
+        printf("[VAD] triggered\n");
         listen_and_chat(true);
       }
     }

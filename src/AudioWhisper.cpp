@@ -1,9 +1,8 @@
 #include <M5Unified.h>
 #include "AudioWhisper.h"
 
-//constexpr size_t record_number = 300/2;
-constexpr size_t record_number = 400;
-//constexpr size_t record_number = 200;
+// 最大6秒 (無音検出で早期打ち切りされるので通常はもっと短い)
+constexpr size_t record_number = 640;
 constexpr size_t record_length = 150;
 constexpr size_t record_size = record_number * record_length;
 constexpr size_t record_samplerate = 16000;
@@ -13,6 +12,7 @@ AudioWhisper::AudioWhisper() {
   const auto size = record_size * sizeof(int16_t) + headerSize;
   record_buffer = static_cast<byte*>(::heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   ::memset(record_buffer, 0, size);
+  wav_size = size;
 }
 
 AudioWhisper::~AudioWhisper() {
@@ -20,11 +20,11 @@ AudioWhisper::~AudioWhisper() {
 }
 
 size_t AudioWhisper::GetSize() const {
-  return record_size * sizeof(int16_t) + headerSize;
+  return wav_size;
 }
 
-int16_t* MakeHeader(byte* header) {
-  const auto wavDataSize = record_number * record_length * 2;
+int16_t* MakeHeader(byte* header, size_t sampleCount) {
+  const auto wavDataSize = sampleCount * 2;
   header[0] = 'R';
   header[1] = 'I';
   header[2] = 'F';
@@ -73,12 +73,42 @@ int16_t* MakeHeader(byte* header) {
   return (int16_t*)&header[headerSize];
 }
 
-void AudioWhisper::Record() {
+void AudioWhisper::Record(const int16_t* preroll, size_t prerollSamples, int silenceStopPeak) {
   M5.Mic.begin();
-  auto *wavData = MakeHeader(record_buffer);
-  for (int rec_record_idx = 0; rec_record_idx < record_number; ++rec_record_idx) {
-    auto data = &wavData[rec_record_idx * record_length];
-    M5.Mic.record(data, record_length, record_samplerate);
+  auto *wavData = reinterpret_cast<int16_t*>(&record_buffer[headerSize]);
+  size_t offset = 0;
+  if (preroll && prerollSamples > 0) {
+    if (prerollSamples > record_size) prerollSamples = record_size;
+    ::memcpy(wavData, preroll, prerollSamples * sizeof(int16_t));
+    offset = prerollSamples;
   }
+  // 発話終了検出: 一度声が入った後、silenceStopPeak 未満が 1.5 秒続いたら打ち切る。
+  // (短い呼びかけ+長い無音を Whisper に送ると幻聴になるため。
+  //  1.5 秒は息継ぎや文中の間で切れない程度の余裕)
+  const int stop_chunks = (int)(1.5f * record_samplerate / record_length);
+  bool voice_seen = (prerollSamples > 0);  // プリロール有 = トリガ済みの声がある
+  int silent_run = 0;
+  while (offset + record_length <= record_size) {
+    M5.Mic.record(&wavData[offset], record_length, record_samplerate);
+    offset += record_length;
+    // record() は非同期 (キュー2段) なので、書き込み完了済みの3チャンク前を評価する
+    if (silenceStopPeak > 0 && offset >= prerollSamples + 3 * record_length) {
+      const int16_t* done = &wavData[offset - 3 * record_length];
+      int peak = 0;
+      for (size_t i = 0; i < record_length; i++) {
+        int v = abs((int)done[i]);
+        if (v > peak) peak = v;
+      }
+      if (peak >= silenceStopPeak) {
+        voice_seen = true;
+        silent_run = 0;
+      } else if (voice_seen && ++silent_run >= stop_chunks) {
+        break;
+      }
+    }
+  }
+  while (M5.Mic.isRecording()) { M5.delay(1); }  // 投入済みチャンクの完了を待つ
   M5.Mic.end();
+  MakeHeader(record_buffer, offset);
+  wav_size = offset * sizeof(int16_t) + headerSize;
 }
