@@ -1,0 +1,1323 @@
+// =============================================================================
+// Chibi StackChan - ATOMS3R AI Chatbot Kit (AtomS3R + Atomic Echo Base)
+//
+//   LLM : Google Gemini (gemini-3.5-flash)
+//   STT : OpenAI Whisper
+//   TTS : VoiceVox Web API
+//   顔  : m5stack-avatar (128x128 に縮小表示、吹き出しなし)
+//   首  : SG90 PWM サーボ x1 (Grove)。左右首振りのみ・連続回転なし
+//   起動: 呼びかけワード (Web UI で変更可) または 画面(Aボタン)クリック
+//   設定: NVS 保存。未設定/接続失敗/起動時に画面長押し → APポータル
+//         (SSID: ChibiStackChan-Setup / pass: stackchan / http://192.168.4.1)
+//   おまけ: 今日の天気(Open-Meteo) と 現在時刻(NTP) を会話に反映
+//
+// guruguru-stackchan (Core2) からの派生。BLE/バスサーボ/esp-srウェイクワードは
+// 使わず、呼びかけ判定は「音量トリガ → Whisper → 呼びかけワード照合」方式。
+// =============================================================================
+#include <Arduino.h>
+#include <SPIFFS.h>
+#include <M5Unified.h>
+#include <nvs.h>
+#include <Avatar.h>
+
+#include <AudioOutput.h>
+#include <AudioFileSourceBuffer.h>
+#include <AudioGeneratorMP3.h>
+#include "AudioFileSourceHTTPSStream.h"
+#include "AudioOutputM5Speaker.h"
+#include "WebVoiceVoxTTS.h"
+
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include "rootCACertificate.h"
+#include "rootCAgoogle.h"
+#include <ArduinoJson.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <deque>
+#include <algorithm>
+
+#include "AudioWhisper.h"
+#include "Whisper.h"
+#include "HeadServo.h"
+#include "WeatherClock.h"
+
+// NVS が空のときの初期値 (include/secrets.h, git管理外)
+#include "secrets.h"
+
+#define MDNS_HOST "chibi-chan"
+
+// 保存する質問と回答の最大数
+const int MAX_HISTORY = 5;
+std::deque<String> chatHistory;
+
+/// set M5Speaker virtual channel (0-7)
+static constexpr uint8_t m5spk_virtual_channel = 0;
+
+using namespace m5avatar;
+Avatar avatar;
+const Expression expressions_table[] = {
+  Expression::Neutral,
+  Expression::Happy,
+  Expression::Sleepy,
+  Expression::Doubt,
+  Expression::Sad,
+  Expression::Angry
+};
+
+WebServer server(80);
+
+//---------------------------------------------
+String GEMINI_API_KEY = "";    // Google Gemini (LLM / conversation)
+String OPENAI_API_KEY = "";    // OpenAI (Whisper speech-to-text)
+String VOICEVOX_API_KEY = "";  // VoiceVox (text-to-speech)
+String CFG_WIFI_SSID = "";
+String CFG_WIFI_PASS = "";
+
+// 呼びかけ (ウェイクワード)。カンマ/読点区切りで複数登録可。
+String WAKE_PHRASE = "スタックちゃん";
+bool   wake_enable = true;
+int    vad_threshold = 1500;   // 音量トリガのしきい値 (int16 peak, 200-8000)
+
+// 天気の場所 (Web UI で変更可)
+String WEATHER_PLACE = "東京";
+float  WEATHER_LAT = 35.6812f;
+float  WEATHER_LON = 139.7671f;
+
+// 最新の返答から選んだ表情 (発話中に適用)
+Expression g_reply_expression = Expression::Neutral;
+String TTS_SPEAKER_NO = "3";
+String TTS_SPEAKER = "&speaker=";
+String TTS_PARMS = TTS_SPEAKER + TTS_SPEAKER_NO;
+
+bool portal_mode = false;      // AP設定ポータル動作中か
+//---------------------------------------------
+
+static const char HEAD_HTML[] PROGMEM = R"KEWL(
+<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ちびスタックちゃん</title></head>)KEWL";
+
+String speech_text = "";
+String speech_text_buffer = "";
+DynamicJsonDocument chat_doc(1024 * 10);
+String InitBuffer = "";
+int GEMINI_LAST_HTTP_CODE = 0;
+
+static const char GEMINI_API_URL[] = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent";
+
+static const char kBaseChatJson[] = "{\"messages\":[]}";
+static const char kExpressionTagRule[] =
+    "返答の先頭に感情タグを1つだけ付けてください: [happy] [sad] [angry] [sleepy] [doubt] [neutral]";
+static const char kDefaultRole[] =
+    "あなたは「ちびスタックちゃん」という小さくてかわいいロボットです。"
+    "一人称は「ぼく」。日本語で、話し言葉で短く(60文字以内で)答えてください。";
+
+bool init_chat_doc(const char *data) {
+  DeserializationError error = deserializeJson(chat_doc, data);
+  if (error) {
+    Serial.println("DeserializationError");
+    return false;
+  }
+  return true;
+}
+
+// システムプロンプト(ロール)を組み立てて InitBuffer に反映
+void applyRole(const String& roleText) {
+  init_chat_doc(kBaseChatJson);
+  JsonArray messages = chat_doc["messages"];
+  JsonObject m = messages.createNestedObject();
+  m["role"] = "system";
+  m["content"] = roleText + "\n" + kExpressionTagRule;
+  InitBuffer = "";
+  serializeJson(chat_doc, InitBuffer);
+}
+
+// ====================================================================
+//  NVS helpers
+// ====================================================================
+static String nvs_get_string(const char* ns, const char* key) {
+  String out = "";
+  uint32_t h;
+  if (ESP_OK == nvs_open(ns, NVS_READONLY, &h)) {
+    size_t len = 0;
+    if (ESP_OK == nvs_get_str(h, key, nullptr, &len) && len > 0) {
+      char* buf = (char*)malloc(len);
+      if (buf) {
+        if (ESP_OK == nvs_get_str(h, key, buf, &len)) out = String(buf);
+        free(buf);
+      }
+    }
+    nvs_close(h);
+  }
+  return out;
+}
+
+static void nvs_set_string(const char* ns, const char* key, const String& v) {
+  uint32_t h;
+  if (ESP_OK == nvs_open(ns, NVS_READWRITE, &h)) {
+    nvs_set_str(h, key, v.c_str());
+    nvs_close(h);
+  }
+}
+
+static uint8_t nvs_get_u8_or(const char* ns, const char* key, uint8_t def) {
+  uint8_t v = def;
+  uint32_t h;
+  if (ESP_OK == nvs_open(ns, NVS_READONLY, &h)) {
+    nvs_get_u8(h, key, &v);
+    nvs_close(h);
+  }
+  return v;
+}
+
+static void nvs_set_u8v(const char* ns, const char* key, uint8_t v) {
+  uint32_t h;
+  if (ESP_OK == nvs_open(ns, NVS_READWRITE, &h)) {
+    nvs_set_u8(h, key, v);
+    nvs_close(h);
+  }
+}
+
+// 設定は専用の名前空間 "chibi" に保存 (Wi-Fi は "wifi", 音量等は "setting")
+void loadConfigFromNvs() {
+  // 「鍵情報クリア」直後は secrets.h へのフォールバックもしない
+  bool nofallback = nvs_get_u8_or("chibi", "nofallback", 0) != 0;
+
+  CFG_WIFI_SSID = nvs_get_string("wifi", "ssid");
+  CFG_WIFI_PASS = nvs_get_string("wifi", "pass");
+  if (CFG_WIFI_SSID == "" && !nofallback) {
+    CFG_WIFI_SSID = String(WIFI_SSID);
+    CFG_WIFI_PASS = String(WIFI_PASS);
+    if (CFG_WIFI_SSID == "YOUR_WIFI_SSID") CFG_WIFI_SSID = "";
+  }
+
+  GEMINI_API_KEY   = nvs_get_string("chibi", "gemini");
+  OPENAI_API_KEY   = nvs_get_string("chibi", "openai");
+  VOICEVOX_API_KEY = nvs_get_string("chibi", "voicevox");
+  if (!nofallback) {
+    if (GEMINI_API_KEY == "")   GEMINI_API_KEY   = String(GEMINI_APIKEY);
+    if (OPENAI_API_KEY == "")   OPENAI_API_KEY   = String(OPENAI_APIKEY);
+    if (VOICEVOX_API_KEY == "") VOICEVOX_API_KEY = String(VOICEVOX_APIKEY);
+  }
+
+  String w = nvs_get_string("chibi", "wake");
+  if (w != "") WAKE_PHRASE = w;
+  wake_enable = nvs_get_u8_or("chibi", "wake_en", 1) != 0;
+  String v = nvs_get_string("chibi", "vad");
+  if (v != "") vad_threshold = constrain(v.toInt(), 200, 8000);
+
+  String place = nvs_get_string("chibi", "place");
+  if (place != "") WEATHER_PLACE = place;
+  String lat = nvs_get_string("chibi", "lat");
+  String lon = nvs_get_string("chibi", "lon");
+  if (lat != "" && lon != "") {
+    WEATHER_LAT = lat.toFloat();
+    WEATHER_LON = lon.toFloat();
+  }
+}
+
+// ====================================================================
+//  Web UI (iPhone のブラウザから設定)
+// ====================================================================
+static const char CONFIG_HTML[] PROGMEM = R"KEWL(
+<!DOCTYPE html><html lang="ja"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ちびスタックちゃん設定</title><style>
+ body{font-family:sans-serif;background:#111;color:#eee;margin:0;padding:18px}
+ h1{font-size:20px} .card{background:#1d1d22;border-radius:12px;padding:16px;margin:12px 0;max-width:480px}
+ label{display:block;font-size:13px;color:#aaa;margin-top:10px}
+ input,select{width:100%;box-sizing:border-box;font-size:16px;padding:10px;border-radius:8px;border:1px solid #444;background:#222;color:#fff}
+ button{font-size:17px;padding:14px 18px;margin-top:16px;border:0;border-radius:10px;background:#2d6cff;color:#fff;width:100%;max-width:480px;display:block}
+ button.danger{background:#c0392b}
+ small{color:#888}
+</style></head><body>
+<h1>ちびスタックちゃん 設定</h1>
+<form onsubmit="save(event)">
+ <div class="card">
+  <b>Wi-Fi (2.4GHz のみ)</b>
+  <label>SSID</label><input id="ssid" name="ssid" placeholder="{{ssid}}">
+  <label>パスワード</label><input id="pass" name="pass" type="password">
+ </div>
+ <div class="card">
+  <b>APIキー</b><br><small>空欄の項目は変更されません。</small>
+  <label>Gemini API Key (会話)</label><input id="gemini" name="gemini">
+  <label>OpenAI API Key (音声認識 Whisper)</label><input id="openai" name="openai">
+  <label>VoiceVox API Key (音声合成)</label><input id="voicevox" name="voicevox">
+ </div>
+ <div class="card">
+  <b>呼びかけ (ウェイクワード)</b>
+  <label>呼びかけワード (カンマ区切りで複数可)</label>
+  <input id="wake" name="wake" placeholder="{{wake}}">
+  <label>呼びかけ起動</label>
+  <select id="wake_en"><option value="1" {{wen1}}>有効</option><option value="0" {{wen0}}>無効 (画面タッチのみ)</option></select>
+  <label>音量トリガ感度 (200=敏感 〜 8000=鈍感)</label>
+  <input id="vad" name="vad" type="number" min="200" max="8000" placeholder="{{vad}}">
+ </div>
+ <div class="card">
+  <b>声・音</b>
+  <label>VoiceVox 話者番号 (0-60)</label><input id="speaker" type="number" min="0" max="60" placeholder="{{speaker}}">
+  <label>スピーカー音量 (0-255)</label><input id="volume" type="number" min="0" max="255" placeholder="{{volume}}">
+  <label>マイク感度 (1-255)</label><input id="mic" type="number" min="1" max="255" placeholder="{{mic}}">
+ </div>
+ <div class="card">
+  <b>天気の場所</b>
+  <label>地名 (読み上げ用)</label><input id="place" placeholder="{{place}}">
+  <label>緯度</label><input id="lat" type="number" step="0.0001" placeholder="{{lat}}">
+  <label>経度</label><input id="lon" type="number" step="0.0001" placeholder="{{lon}}">
+ </div>
+ <button type="submit">保存して再起動</button>
+</form>
+<button class="danger" onclick="clearKeys()">鍵情報クリア (Wi-Fi・APIキーを消去)</button>
+<script>
+ function save(e){
+  e.preventDefault();
+  const f=new FormData();
+  for(const id of ["ssid","pass","gemini","openai","voicevox","wake","wake_en","vad","speaker","volume","mic","place","lat","lon"]){
+   const v=document.getElementById(id).value;
+   if(v!=="") f.append(id,v);
+  }
+  fetch("/wifi_set",{method:"POST",body:f}).then(r=>r.text()).then(t=>{
+   document.body.innerHTML="<h1>保存しました</h1><p>再起動します。数秒後にWi-Fiへ接続します。</p>";
+  });
+ }
+ function clearKeys(){
+  if(!confirm("Wi-Fi情報とAPIキーをすべて消去します。よろしいですか？"))return;
+  fetch("/clear_keys",{method:"POST"}).then(r=>r.text()).then(t=>{
+   document.body.innerHTML="<h1>消去しました</h1><p>再起動して設定モード(AP)で立ち上がります。</p>";
+  });
+ }
+</script>
+</body></html>)KEWL";
+
+static const char ROLE_HTML[] PROGMEM = R"KEWL(
+<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ロール設定</title>
+<style>body{font-family:sans-serif;background:#111;color:#eee;padding:18px}
+textarea{width:100%;height:200px;font-size:15px;background:#222;color:#fff;border-radius:8px}
+button{font-size:17px;padding:12px 18px;margin-top:12px;border:0;border-radius:10px;background:#2d6cff;color:#fff}</style>
+</head><body>
+<h1>ロール設定</h1>
+<p>キャラ設定(システムプロンプト)を入力。空で送ると既定に戻ります。<br>
+感情タグのルールは自動で追記されます。</p>
+<form onsubmit="postData(event)">
+ <textarea id="textarea"></textarea><br>
+ <button type="submit">送信</button>
+</form>
+<script>
+function postData(e){
+ e.preventDefault();
+ const xhr=new XMLHttpRequest();
+ xhr.open("POST","/role_set",true);
+ xhr.setRequestHeader("Content-Type","text/plain;charset=UTF-8");
+ xhr.onload=()=>{document.open();document.write(xhr.responseText);document.close();};
+ xhr.send(document.getElementById("textarea").value.trim());
+}
+</script></body></html>)KEWL";
+
+void handle_config();  // forward (handleNotFound から使う)
+
+void handleNotFound() {
+  if (portal_mode) {  // ポータル中はどのURLでも設定ページへ (captive-portal風)
+    handle_config();
+    return;
+  }
+  server.send(404, "text/html", String(HEAD_HTML) + "<body>Not Found</body>");
+}
+
+void handle_config() {
+  String html = FPSTR(CONFIG_HTML);
+  html.replace("{{ssid}}", CFG_WIFI_SSID == "" ? "(未設定)" : CFG_WIFI_SSID);
+  html.replace("{{wake}}", WAKE_PHRASE);
+  html.replace("{{wen1}}", wake_enable ? "selected" : "");
+  html.replace("{{wen0}}", wake_enable ? "" : "selected");
+  html.replace("{{vad}}", String(vad_threshold));
+  html.replace("{{speaker}}", TTS_SPEAKER_NO);
+  html.replace("{{volume}}", String(M5.Speaker.getVolume()));
+  html.replace("{{mic}}", String(M5.Mic.config().magnification));
+  html.replace("{{place}}", WEATHER_PLACE);
+  html.replace("{{lat}}", String(WEATHER_LAT, 4));
+  html.replace("{{lon}}", String(WEATHER_LON, 4));
+  server.send(200, "text/html", html);
+}
+
+void handle_config_set() {
+  if (server.method() != HTTP_POST) {
+    server.send(405, "text/plain", "POST only");
+    return;
+  }
+  String ssid = server.arg("ssid");
+  if (ssid != "") {
+    nvs_set_string("wifi", "ssid", ssid);
+    nvs_set_string("wifi", "pass", server.arg("pass"));  // 空=オープンネットワーク
+  }
+  if (server.arg("gemini") != "")   nvs_set_string("chibi", "gemini", server.arg("gemini"));
+  if (server.arg("openai") != "")   nvs_set_string("chibi", "openai", server.arg("openai"));
+  if (server.arg("voicevox") != "") nvs_set_string("chibi", "voicevox", server.arg("voicevox"));
+  if (server.arg("wake") != "")     nvs_set_string("chibi", "wake", server.arg("wake"));
+  if (server.arg("wake_en") != "")  nvs_set_u8v("chibi", "wake_en", server.arg("wake_en").toInt() ? 1 : 0);
+  if (server.arg("vad") != "")      nvs_set_string("chibi", "vad", server.arg("vad"));
+  if (server.arg("place") != "")    nvs_set_string("chibi", "place", server.arg("place"));
+  if (server.arg("lat") != "")      nvs_set_string("chibi", "lat", server.arg("lat"));
+  if (server.arg("lon") != "")      nvs_set_string("chibi", "lon", server.arg("lon"));
+
+  uint32_t h;
+  if (ESP_OK == nvs_open("setting", NVS_READWRITE, &h)) {
+    if (server.arg("volume") != "") {
+      uint32_t vol = constrain(server.arg("volume").toInt(), 0, 255);
+      nvs_set_u32(h, "volume", vol);
+    }
+    if (server.arg("speaker") != "") {
+      nvs_set_u8(h, "speaker", constrain(server.arg("speaker").toInt(), 0, 60));
+    }
+    if (server.arg("mic") != "") {
+      nvs_set_u8(h, "micgain", constrain(server.arg("mic").toInt(), 1, 255));
+    }
+    nvs_close(h);
+  }
+
+  // 何か保存された = 意図した設定があるので secrets.h フォールバック禁止を解除
+  nvs_set_u8v("chibi", "nofallback", 0);
+
+  Serial.println("[CFG] settings saved, restarting...");
+  server.send(200, "text/plain", "OK");
+  delay(1200);
+  ESP.restart();
+}
+
+// 鍵情報クリア: Wi-Fi と APIキー等 (NVS) を全消去して再起動 → APポータルへ
+void handle_clear_keys() {
+  if (server.method() != HTTP_POST) {
+    server.send(405, "text/plain", "POST only");
+    return;
+  }
+  uint32_t h;
+  if (ESP_OK == nvs_open("wifi", NVS_READWRITE, &h)) {
+    nvs_erase_all(h);
+    nvs_close(h);
+  }
+  if (ESP_OK == nvs_open("chibi", NVS_READWRITE, &h)) {
+    nvs_erase_all(h);
+    nvs_close(h);
+  }
+  // secrets.h の初期値でも繋がらないように (次の保存で解除される)
+  nvs_set_u8v("chibi", "nofallback", 1);
+  Serial.println("[CFG] keys cleared, restarting...");
+  server.send(200, "text/plain", "OK");
+  delay(1200);
+  ESP.restart();
+}
+
+// ====================================================================
+//  Gemini
+// ====================================================================
+String https_post_json_gemini(const char* url, const char* json_string,
+                              const char* root_ca, const char* api_key) {
+  String payload = "";
+  GEMINI_LAST_HTTP_CODE = 0;
+  WiFiClientSecure *client = new WiFiClientSecure;
+  if (client) {
+    client->setCACert(root_ca);
+    {
+      HTTPClient https;
+      https.setTimeout(65000);
+
+      String requestUrl = String(url) + "?key=" + String(api_key);
+      Serial.print("[HTTPS] begin...\n");
+      if (https.begin(*client, requestUrl)) {
+        int httpCode = -1;
+        for (int retry = 0; retry < 3; retry++) {
+          Serial.print("[HTTPS] POST...\n");
+          https.addHeader("Content-Type", "application/json");
+          httpCode = https.POST((uint8_t *)json_string, strlen(json_string));
+
+          if (httpCode > 0) {
+            GEMINI_LAST_HTTP_CODE = httpCode;
+            Serial.printf("[HTTPS] POST... code: %d\n", httpCode);
+            if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_MOVED_PERMANENTLY) {
+              payload = https.getString();
+              break;
+            }
+            String errorPayload = https.getString();
+            if (errorPayload != "") {
+              Serial.println("[HTTPS] error payload:");
+              Serial.println(errorPayload);
+            }
+            if (httpCode == HTTP_CODE_TOO_MANY_REQUESTS && retry < 2) {
+              int waitMs = 1200 * (retry + 1);
+              Serial.printf("[HTTPS] 429 Too Many Requests. retry in %d ms\n", waitMs);
+              delay(waitMs);
+              continue;
+            }
+            if (httpCode == HTTP_CODE_NOT_FOUND) {
+              break;
+            }
+          } else {
+            Serial.printf("[HTTPS] POST... failed, error: %s\n",
+                          https.errorToString(httpCode).c_str());
+            break;
+          }
+        }
+        https.end();
+      } else {
+        Serial.printf("[HTTPS] Unable to connect\n");
+      }
+    }
+    delete client;
+  } else {
+    Serial.println("Unable to create client");
+  }
+  return payload;
+}
+
+// OpenAI 形式の messages JSON を Gemini 形式へ変換
+String buildGeminiRequestFromChatJson(const String& chatJson) {
+  DynamicJsonDocument inDoc(1024 * 10);
+  if (deserializeJson(inDoc, chatJson) != DeserializationError::Ok) {
+    return "";
+  }
+
+  DynamicJsonDocument outDoc(1024 * 12);
+  JsonArray contents = outDoc.createNestedArray("contents");
+  bool hasSystem = false;
+
+  JsonArray inMessages = inDoc["messages"].as<JsonArray>();
+  for (JsonObject msg : inMessages) {
+    const char* role = msg["role"] | "";
+    const char* content = msg["content"] | "";
+    if (!content || strlen(content) == 0) {
+      continue;
+    }
+
+    if (String(role) == "system") {
+      if (!hasSystem) {
+        JsonObject systemInstruction = outDoc.createNestedObject("systemInstruction");
+        JsonArray parts = systemInstruction.createNestedArray("parts");
+        JsonObject part = parts.createNestedObject();
+        part["text"] = content;
+        hasSystem = true;
+      }
+      continue;
+    }
+
+    JsonObject contentObj = contents.createNestedObject();
+    if (String(role) == "assistant") {
+      contentObj["role"] = "model";
+    } else {
+      contentObj["role"] = "user";
+    }
+
+    JsonArray parts = contentObj.createNestedArray("parts");
+    JsonObject part = parts.createNestedObject();
+    part["text"] = content;
+  }
+
+  if (contents.size() == 0) {
+    JsonObject contentObj = contents.createNestedObject();
+    contentObj["role"] = "user";
+    JsonArray parts = contentObj.createNestedArray("parts");
+    JsonObject part = parts.createNestedObject();
+    part["text"] = "こんにちは";
+  }
+
+  String result;
+  serializeJson(outDoc, result);
+  return result;
+}
+
+// 返答テキストから表情を選ぶ ([happy]等のタグ優先、なければキーワード)
+Expression pickExpression(const String& textIn) {
+  String t = textIn;
+  t.toLowerCase();
+  if (t.indexOf("[happy]") >= 0)   return Expression::Happy;
+  if (t.indexOf("[sad]") >= 0)     return Expression::Sad;
+  if (t.indexOf("[angry]") >= 0)   return Expression::Angry;
+  if (t.indexOf("[sleepy]") >= 0)  return Expression::Sleepy;
+  if (t.indexOf("[doubt]") >= 0)   return Expression::Doubt;
+  if (t.indexOf("[neutral]") >= 0) return Expression::Neutral;
+
+  const String& s = textIn;
+  if (s.indexOf("ごめん") >= 0 || s.indexOf("残念") >= 0 || s.indexOf("悲し") >= 0 ||
+      s.indexOf("つら") >= 0 || s.indexOf("さみし") >= 0)
+    return Expression::Sad;
+  if (s.indexOf("怒") >= 0 || s.indexOf("だめ") >= 0 || s.indexOf("ダメ") >= 0 ||
+      s.indexOf("こら") >= 0)
+    return Expression::Angry;
+  if (s.indexOf("眠") >= 0 || s.indexOf("ねむ") >= 0 || s.indexOf("おやすみ") >= 0)
+    return Expression::Sleepy;
+  if (s.indexOf("？") >= 0 || s.indexOf("?") >= 0 || s.indexOf("わからない") >= 0 ||
+      s.indexOf("かな") >= 0 || s.indexOf("はて") >= 0)
+    return Expression::Doubt;
+  if (s.indexOf("！") >= 0 || s.indexOf("!") >= 0 || s.indexOf("嬉し") >= 0 ||
+      s.indexOf("楽し") >= 0 || s.indexOf("ありがと") >= 0 || s.indexOf("やった") >= 0 ||
+      s.indexOf("すごい") >= 0 || s.indexOf("好き") >= 0)
+    return Expression::Happy;
+  return Expression::Neutral;
+}
+
+// 読み上げ前に "[emotion]" タグを除去
+String stripExpressionTag(String s) {
+  const char* tags[] = {"[happy]", "[sad]", "[angry]", "[sleepy]", "[doubt]", "[neutral]"};
+  for (const char* tag : tags) {
+    int idx;
+    while ((idx = s.indexOf(tag)) >= 0) {
+      s.remove(idx, strlen(tag));
+    }
+  }
+  s.trim();
+  return s;
+}
+
+String chatGemini(String json_string) {
+  String response = "";
+  avatar.setExpression(Expression::Doubt);  // 考え中
+  String geminiRequest = buildGeminiRequestFromChatJson(json_string);
+  if (geminiRequest == "") {
+    avatar.setExpression(Expression::Sad);
+    delay(1000);
+    avatar.setExpression(Expression::Neutral);
+    return "エラーです";
+  }
+  String ret = https_post_json_gemini(GEMINI_API_URL, geminiRequest.c_str(),
+                                      root_ca_google, GEMINI_API_KEY.c_str());
+  avatar.setExpression(Expression::Neutral);
+  Serial.println(ret);
+  if (ret != "") {
+    DynamicJsonDocument doc(5000);
+    DeserializationError error = deserializeJson(doc, ret.c_str());
+    if (error) {
+      Serial.print(F("deserializeJson() failed: "));
+      Serial.println(error.f_str());
+      avatar.setExpression(Expression::Sad);
+      response = "エラーです";
+      delay(1000);
+      avatar.setExpression(Expression::Neutral);
+    } else {
+      const char* data = doc["candidates"][0]["content"]["parts"][0]["text"];
+      Serial.println(data);
+      if (data) {
+        response = String(data);
+        std::replace(response.begin(), response.end(), '\n', ' ');
+        g_reply_expression = pickExpression(response);
+        response = stripExpressionTag(response);
+      } else {
+        response = "わかりません";
+      }
+    }
+  } else {
+    avatar.setExpression(Expression::Sad);
+    if (GEMINI_LAST_HTTP_CODE == HTTP_CODE_TOO_MANY_REQUESTS) {
+      response = "ただいま混み合っています。少し待ってからもう一度話しかけてね。";
+    } else if (GEMINI_LAST_HTTP_CODE == HTTP_CODE_NOT_FOUND) {
+      response = "Geminiのモデルまたはエーピーアイ設定が見つかりません。設定を確認してください。";
+    } else {
+      response = "わかりません";
+    }
+    delay(1000);
+    avatar.setExpression(Expression::Neutral);
+  }
+  return response;
+}
+
+// 質問に「現在日時」+ (天気の話題なら)「今日の天気」を参考情報として添付し、
+// Gemini に投げる。返答は speech_text 経由で読み上げられる。
+String exec_chat(String text) {
+  init_chat_doc(InitBuffer.c_str());
+  chatHistory.push_back(text);
+  if (chatHistory.size() > MAX_HISTORY * 2) {
+    chatHistory.pop_front();
+    chatHistory.pop_front();
+  }
+
+  JsonArray messages = chat_doc["messages"];
+  for (int i = 0; i < (int)chatHistory.size(); i++) {
+    JsonObject m = messages.createNestedObject();
+    m["role"] = (i % 2 == 0) ? "user" : "assistant";
+    m["content"] = chatHistory[i];
+  }
+
+  // 最新のユーザ発話に参考情報を添付 (履歴には残さない)
+  String ctx = "";
+  String now = wc::nowJa();
+  if (now != "") ctx += "現在日時: " + now + "。";
+  if (wc::wantsWeather(text)) {
+    avatar.setExpression(Expression::Doubt);
+    String weather;
+    if (wc::fetchTodayWeather(weather)) ctx += weather;
+  }
+  if (ctx != "") {
+    messages[messages.size() - 1]["content"] = text + "\n(参考情報: " + ctx + ")";
+  }
+
+  String json_string;
+  serializeJson(chat_doc, json_string);
+
+  String response = chatGemini(json_string);
+  speech_text = response;
+  chatHistory.push_back(response);
+  return response;
+}
+
+// ====================================================================
+//  Web handlers (通常運用時)
+// ====================================================================
+void handleRoot() {
+  if (portal_mode) {
+    handle_config();
+    return;
+  }
+  String html = String(HEAD_HTML) +
+    "<body style=\"font-family:sans-serif;background:#111;color:#eee;padding:18px\">"
+    "<h1>ちびスタックちゃん</h1><ul style=\"line-height:2.2;font-size:18px\">"
+    "<li><a style=\"color:#7fb0ff\" href=\"/wifi\">設定 (Wi-Fi / APIキー / 呼びかけ / 天気)</a></li>"
+    "<li><a style=\"color:#7fb0ff\" href=\"/role\">ロール (キャラ設定)</a></li>"
+    "<li><a style=\"color:#7fb0ff\" href=\"/role_get\">現在のロール確認</a></li></ul>"
+    "<form action=\"/speech\"><input name=\"say\" placeholder=\"しゃべらせる\" style=\"font-size:16px;padding:8px\">"
+    "<button style=\"font-size:16px;padding:8px\">送信</button></form>"
+    "<form action=\"/chat\"><input name=\"text\" placeholder=\"文字で質問する\" style=\"font-size:16px;padding:8px\">"
+    "<button style=\"font-size:16px;padding:8px\">送信</button></form>"
+    "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handle_speech() {
+  String message = server.arg("say");
+  String speaker = server.arg("voice");
+  if (speaker != "") {
+    TTS_PARMS = TTS_SPEAKER + speaker;
+  }
+  Serial.println(message);
+  if (message != "" && speech_text == "" && speech_text_buffer == "") {
+    g_reply_expression = Expression::Happy;
+    speech_text = message;
+    server.send(200, "text/plain", "OK");
+  } else {
+    server.send(200, "text/plain", "busy");
+  }
+}
+
+void handle_chat() {
+  String text = server.arg("text");
+  String speaker = server.arg("voice");
+  if (speaker != "") {
+    TTS_PARMS = TTS_SPEAKER + speaker;
+  }
+  String response;
+  if (text == "") {
+    response = "text パラメータがありません";
+  } else if (speech_text == "" && speech_text_buffer == "") {
+    response = exec_chat(text);
+  } else {
+    response = "busy";
+  }
+  server.send(200, "text/html", String(HEAD_HTML) + "<body>" + response + "</body>");
+}
+
+void handle_face() {
+  String expression = server.arg("expression");
+  int idx = expression.toInt();
+  const int n = sizeof(expressions_table) / sizeof(expressions_table[0]);
+  if (idx >= 0 && idx < n) avatar.setExpression(expressions_table[idx]);
+  server.send(200, "text/plain", "OK");
+}
+
+void handle_setting() {
+  String value = server.arg("volume");
+  String speaker = server.arg("speaker");
+  String mic = server.arg("mic");
+
+  size_t speaker_no = 0;
+  if (speaker != "") {
+    speaker_no = constrain(speaker.toInt(), 0, 60);
+    TTS_SPEAKER_NO = String(speaker_no);
+    TTS_PARMS = TTS_SPEAKER + TTS_SPEAKER_NO;
+  }
+
+  size_t micgain = 0;
+  if (mic != "") {
+    micgain = constrain(mic.toInt(), 1, 255);
+    auto micConfig = M5.Mic.config();
+    micConfig.magnification = (uint8_t)micgain;
+    M5.Mic.config(micConfig);
+  }
+
+  size_t volume = constrain(value.toInt(), 0, 255);
+  uint32_t nvs_handle;
+  if (ESP_OK == nvs_open("setting", NVS_READWRITE, &nvs_handle)) {
+    if (value != "") nvs_set_u32(nvs_handle, "volume", volume);
+    if (speaker != "") nvs_set_u8(nvs_handle, "speaker", speaker_no);
+    if (mic != "") nvs_set_u8(nvs_handle, "micgain", (uint8_t)micgain);
+    nvs_close(nvs_handle);
+  }
+  if (value != "") {
+    M5.Speaker.setVolume(volume);
+    M5.Speaker.setChannelVolume(m5spk_virtual_channel, volume);
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+bool save_json() {
+  if (!SPIFFS.begin(true)) {
+    Serial.println("An Error has occurred while mounting SPIFFS");
+    return false;
+  }
+  File file = SPIFFS.open("/data.json", "w");
+  if (!file) {
+    Serial.println("Failed to open file for writing");
+    return false;
+  }
+  serializeJson(chat_doc, file);
+  file.close();
+  return true;
+}
+
+void handle_role() {
+  server.send(200, "text/html", ROLE_HTML);
+}
+
+void handle_role_set() {
+  if (server.method() != HTTP_POST) {
+    return;
+  }
+  String role = server.arg("plain");
+  applyRole(role != "" ? role : String(kDefaultRole));
+  chatHistory.clear();
+  init_chat_doc(InitBuffer.c_str());
+  save_json();
+
+  String html = "<html><head><meta charset=\"UTF-8\"></head><body><pre>";
+  serializeJsonPretty(chat_doc, html);
+  html += "</pre><a href=\"/\">戻る</a></body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handle_role_get() {
+  init_chat_doc(InitBuffer.c_str());
+  String html = "<html><head><meta charset=\"UTF-8\"></head><body><pre>";
+  serializeJsonPretty(chat_doc, html);
+  html += "</pre><a href=\"/\">戻る</a></body></html>";
+  server.send(200, "text/html", html);
+}
+
+bool routes_registered = false;
+void registerRoutes() {
+  if (routes_registered) return;
+  routes_registered = true;
+  server.on("/", handleRoot);
+  server.on("/wifi", handle_config);
+  server.on("/wifi_set", HTTP_POST, handle_config_set);
+  server.on("/clear_keys", HTTP_POST, handle_clear_keys);
+  server.on("/speech", handle_speech);
+  server.on("/chat", handle_chat);
+  server.on("/face", handle_face);
+  server.on("/setting", handle_setting);
+  server.on("/role", handle_role);
+  server.on("/role_set", HTTP_POST, handle_role_set);
+  server.on("/role_get", handle_role_get);
+  server.onNotFound(handleNotFound);
+}
+
+// ====================================================================
+//  Audio (TTS 再生まわり)
+// ====================================================================
+AudioOutputM5Speaker out(&M5.Speaker, m5spk_virtual_channel);
+AudioGeneratorMP3 *mp3;
+AudioFileSourceBuffer *buff = nullptr;
+int preallocateBufferSize = 30 * 1024;
+uint8_t *preallocateBuffer;
+AudioFileSourceHTTPSStream *file = nullptr;
+
+void playMP3(AudioFileSourceBuffer *buff) {
+  mp3->begin(buff, &out);
+}
+
+void StatusCallback(void *cbData, int code, const char *string) {
+  const char *ptr = reinterpret_cast<const char *>(cbData);
+  char s1[64];
+  strncpy_P(s1, string, sizeof(s1));
+  s1[sizeof(s1) - 1] = 0;
+  Serial.printf("STATUS(%s) '%d' = '%s'\n", ptr, code, s1);
+  Serial.flush();
+}
+
+void stopPlayback() {
+  if (mp3->isRunning()) mp3->stop();
+  if (buff != nullptr) { delete buff; buff = nullptr; }
+  if (file != nullptr) { delete file; file = nullptr; }
+}
+
+// TTS を再生し終わるまでブロックする ("なあに？" 等の短い相槌用)
+void speakBlocking(const String& text) {
+  M5.Mic.end();
+  M5.Speaker.begin();
+  Voicevox_tts((char*)text.c_str(), (char*)TTS_PARMS.c_str());
+  // 首振り・リップシンクは servo/lipSync タスク側が動かすのでここでは再生のみ
+  uint32_t start = millis();
+  while (mp3->isRunning() && millis() - start < 30000) {
+    if (!mp3->loop()) break;
+    delay(1);
+  }
+  stopPlayback();
+  delay(200);
+  M5.Speaker.end();
+  M5.Mic.begin();
+}
+
+// ====================================================================
+//  Avatar tasks (lipSync / servo)
+// ====================================================================
+void lipSync(void *args) {
+  float gazeX, gazeY;
+  int level = 0;
+  DriveContext *ctx = (DriveContext *)args;
+  Avatar *avatar = ctx->getAvatar();
+  for (;;) {
+    level = abs(*out.getBuffer());
+    if (level < 100) level = 0;
+    if (level > 15000) level = 15000;
+    float open = (float)level / 15000.0;
+    avatar->setMouthOpenRatio(open);
+    avatar->getGaze(&gazeY, &gazeX);
+    avatar->setRotation(gazeX * 5);
+    delay(50);
+  }
+}
+
+void servo(void *args) {
+  (void)args;
+  for (;;) {
+    bool talking = (mp3 != nullptr) && mp3->isRunning();
+    float level01 = 0.0f;
+    if (talking) {
+      int lv = abs(*out.getBuffer());
+      if (lv < 100) lv = 0;
+      if (lv > 15000) lv = 15000;
+      level01 = (float)lv / 15000.0f;
+    }
+    head::update(talking, level01);
+    delay(50);
+  }
+}
+
+// ====================================================================
+//  Wi-Fi setup / AP config portal
+// ====================================================================
+void startConfigPortal() {
+  portal_mode = true;
+  server.stop();
+  WiFi.disconnect(true);
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("ChibiStackChan-Setup", "stackchan");
+  IPAddress ip = WiFi.softAPIP();
+  Serial.printf("[CFG] AP mode: SSID=ChibiStackChan-Setup pass=stackchan  http://%s\n",
+                ip.toString().c_str());
+
+  // 128x128 の小画面向け案内表示
+  M5.Lcd.fillScreen(TFT_BLACK);
+  M5.Lcd.setTextSize(1);
+  M5.Lcd.setCursor(0, 4);
+  M5.Lcd.setTextColor(TFT_YELLOW);
+  M5.Lcd.println(" WiFi SETUP MODE");
+  M5.Lcd.setTextColor(TFT_WHITE);
+  M5.Lcd.println("");
+  M5.Lcd.println(" 1) connect WiFi:");
+  M5.Lcd.println("  ChibiStackChan");
+  M5.Lcd.println("  -Setup");
+  M5.Lcd.println("  pass: stackchan");
+  M5.Lcd.println("");
+  M5.Lcd.println(" 2) open browser:");
+  M5.Lcd.printf("  http://%s\n", ip.toString().c_str());
+
+  registerRoutes();
+  server.begin();
+  for (;;) {
+    server.handleClient();
+    delay(5);
+  }
+}
+
+void Wifi_setup() {
+  if (CFG_WIFI_SSID == "") {
+    Serial.println("[WiFi] no SSID stored -> config portal");
+    startConfigPortal();  // 戻らない
+  }
+  Serial.printf("[WiFi] connecting to '%s'\n", CFG_WIFI_SSID.c_str());
+  WiFi.begin(CFG_WIFI_SSID.c_str(), CFG_WIFI_PASS.c_str());
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    M5.Lcd.print(".");
+    Serial.print(".");
+    // 接続作業中も画面(Aボタン)長押しで設定APへ入れる
+    for (int i = 0; i < 10; i++) {
+      M5.update();
+      if (M5.BtnA.pressedFor(700)) {
+        Serial.println("[WiFi] BtnA held -> config portal");
+        startConfigPortal();
+      }
+      delay(50);
+    }
+    if (millis() - start > 15000) break;  // 15s timeout
+  }
+  M5.Lcd.println("");
+  Serial.println("");
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WiFi] connect failed -> config portal");
+    M5.Lcd.println("WiFi NG");
+    startConfigPortal();  // 戻らない (保存で再起動)
+  }
+}
+
+// ====================================================================
+//  音声認識 (Whisper) と呼びかけ判定
+// ====================================================================
+// 録音中は背景を緑にして「聞いている」ことを画面で示す
+void showListening(bool on) {
+  ColorPalette cp;  // デフォルトは黒背景
+  if (on) cp.set(COLOR_BACKGROUND, TFT_DARKGREEN);
+  avatar.setColorPalette(cp);
+}
+
+String SpeechToText() {
+  Serial.println("\r\nRecord start!\r\n");
+  showListening(true);
+  AudioWhisper* audio = new AudioWhisper();
+  audio->Record();
+  showListening(false);
+  Serial.println("Record end. transcribing...");
+  avatar.setExpression(Expression::Doubt);  // 認識中
+  Whisper* stt = new Whisper(root_ca_openai, OPENAI_API_KEY.c_str());
+  String ret = stt->Transcribe(audio);
+  delete stt;
+  delete audio;
+  avatar.setExpression(Expression::Neutral);
+  return ret;
+}
+
+// Whisper が無音/雑音時に返しがちな定型句 (YouTube学習由来) を弾く
+bool isWhisperHallucination(const String& textIn) {
+  String s = textIn;
+  s.trim();
+  if (s.length() == 0) return true;
+  static const char* kPhrases[] = {
+    "ご視聴",
+    "ご清聴",
+    "視聴ありがと",
+    "チャンネル登録",
+    "高評価",
+    "最後までご覧",
+    "見てくれてありがと",
+    "Thank you for watching",
+    "Thanks for watching",
+    "Please subscribe",
+  };
+  for (const char* p : kPhrases) {
+    if (s.indexOf(p) >= 0) return true;
+  }
+  return false;
+}
+
+// 認識テキストから呼びかけワードを探す。見つかったら開始位置を返し、
+// matchLen にワード長を入れる。カンマ/読点区切りで複数登録可。
+int findWakePhrase(const String& text, int* matchLen) {
+  String phrases = WAKE_PHRASE;
+  phrases.replace("、", ",");
+  int from = 0;
+  while (from < (int)phrases.length()) {
+    int comma = phrases.indexOf(',', from);
+    if (comma < 0) comma = phrases.length();
+    String p = phrases.substring(from, comma);
+    p.trim();
+    if (p.length() > 0) {
+      int idx = text.indexOf(p);
+      if (idx >= 0) {
+        *matchLen = p.length();
+        return idx;
+      }
+    }
+    from = comma + 1;
+  }
+  return -1;
+}
+
+// 呼びかけワード直後の句読点・空白を除去
+String stripLeadingPunct(String s) {
+  while (s.length() > 0) {
+    if (s.startsWith(" ") || s.startsWith("　")) { s.remove(0, s.startsWith(" ") ? 1 : 3); continue; }
+    bool removed = false;
+    const char* punct[] = {"、", "。", "！", "？", "，", "!", "?", ","};
+    for (const char* p : punct) {
+      if (s.startsWith(p)) {
+        s.remove(0, strlen(p));
+        removed = true;
+        break;
+      }
+    }
+    if (!removed) break;
+  }
+  s.trim();
+  return s;
+}
+
+void sw_tone() {
+  M5.Mic.end();
+  M5.Speaker.begin();
+  M5.Speaker.tone(1000, 100);
+  delay(300);
+  M5.Speaker.end();
+  M5.Mic.begin();
+}
+
+// 録音 → Whisper → (必要なら呼びかけ判定) → Gemini
+// require_wake=true のときは呼びかけワードを含まない発話を無視する。
+void listen_and_chat(bool require_wake) {
+  head::center();
+  avatar.setExpression(Expression::Happy);  // 聞いてます
+  String ret = SpeechToText();
+
+  if (ret == "" || isWhisperHallucination(ret)) {
+    if (ret != "") Serial.printf("音声認識: 幻聴とみなし無視 [%s]\n", ret.c_str());
+    if (!require_wake) {  // ボタン起動のときだけ「聞き取れなかった」表現
+      avatar.setExpression(Expression::Sad);
+      delay(1500);
+      avatar.setExpression(Expression::Neutral);
+    }
+    return;
+  }
+  Serial.println("音声認識結果: " + ret);
+
+  if (require_wake) {
+    int matchLen = 0;
+    int idx = findWakePhrase(ret, &matchLen);
+    if (idx < 0) {
+      Serial.println("呼びかけワードなし -> 無視");
+      return;
+    }
+    String rest = stripLeadingPunct(ret.substring(idx + matchLen));
+    if (rest.length() < 6) {  // 呼びかけのみ (日本語2文字未満) -> 聞き返す
+      g_reply_expression = Expression::Happy;
+      avatar.setExpression(Expression::Happy);
+      speakBlocking("なあに？");
+      ret = SpeechToText();
+      if (ret == "" || isWhisperHallucination(ret)) {
+        avatar.setExpression(Expression::Sad);
+        delay(1500);
+        avatar.setExpression(Expression::Neutral);
+        return;
+      }
+      Serial.println("音声認識結果(2): " + ret);
+    } else {
+      ret = rest;
+    }
+  }
+
+  if (!mp3->isRunning() && speech_text == "" && speech_text_buffer == "") {
+    exec_chat(ret);
+  }
+}
+
+// アイドル時の音量トリガ (声がしたら true)
+bool vad_triggered() {
+  static int hot = 0;
+  static int16_t buf[320];  // 20ms @ 16kHz
+  if (!M5.Mic.isEnabled()) {
+    M5.Mic.begin();
+    return false;
+  }
+  if (!M5.Mic.record(buf, 320, 16000)) return false;
+  int peak = 0;
+  for (int i = 0; i < 320; i++) {
+    int v = abs(buf[i]);
+    if (v > peak) peak = v;
+  }
+  // しきい値調整用: 直近1秒の最大ピークを毎秒ログに出す
+  static int log_peak = 0;
+  static uint32_t log_at = 0;
+  if (peak > log_peak) log_peak = peak;
+  if (millis() - log_at >= 1000) {
+    Serial.printf("[VAD] peak=%d (threshold=%d)\n", log_peak, vad_threshold);
+    log_peak = 0;
+    log_at = millis();
+  }
+  if (peak >= vad_threshold) {
+    hot++;
+  } else if (hot > 0) {
+    hot--;
+  }
+  if (hot >= 3) {
+    hot = 0;
+    return true;
+  }
+  return false;
+}
+
+// ====================================================================
+//  setup / loop
+// ====================================================================
+void setup() {
+  auto cfg = M5.config();
+  // Atomic Echo Base (ES8311 codec: スピーカー+マイク) を使う
+  // ※ M5Unified 0.2.x 以降が必要
+  cfg.external_speaker.atomic_echo = true;
+  M5.begin(cfg);
+
+  // TTS ストリーミングバッファは PSRAM (8MB) に確保
+  preallocateBuffer = (uint8_t *)heap_caps_malloc(preallocateBufferSize,
+                                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!preallocateBuffer) preallocateBuffer = (uint8_t *)malloc(preallocateBufferSize);
+  if (!preallocateBuffer) {
+    M5.Display.printf("FATAL: no memory for %d bytes\n", preallocateBufferSize);
+    for (;;) { delay(1000); }
+  }
+
+  {
+    auto micConfig = M5.Mic.config();
+    micConfig.stereo = false;
+    micConfig.sample_rate = 16000;
+    uint8_t micgain = nvs_get_u8_or("setting", "micgain", 0);
+    if (micgain > 0) micConfig.magnification = micgain;
+    M5.Mic.config(micConfig);
+  }
+  M5.Mic.begin();
+
+  head::setup();
+
+  // 音量・話者番号を NVS から (初回は既定値を書き込み)
+  {
+    uint32_t nvs_handle;
+    size_t volume = 200;
+    uint8_t speaker_no = 3;
+    if (ESP_OK == nvs_open("setting", NVS_READONLY, &nvs_handle)) {
+      nvs_get_u32(nvs_handle, "volume", &volume);
+      nvs_get_u8(nvs_handle, "speaker", &speaker_no);
+      nvs_close(nvs_handle);
+    } else if (ESP_OK == nvs_open("setting", NVS_READWRITE, &nvs_handle)) {
+      nvs_set_u32(nvs_handle, "volume", volume);
+      nvs_set_u8(nvs_handle, "speaker", speaker_no);
+      nvs_set_u8(nvs_handle, "micgain", 32);
+      nvs_close(nvs_handle);
+    }
+    if (volume > 255) volume = 255;
+    if (speaker_no > 60) speaker_no = 3;
+    M5.Speaker.setVolume(volume);
+    M5.Speaker.setChannelVolume(m5spk_virtual_channel, volume);
+    TTS_SPEAKER_NO = String(speaker_no);
+    TTS_PARMS = TTS_SPEAKER + TTS_SPEAKER_NO;
+  }
+
+  M5.Lcd.setTextSize(1);
+  Serial.println("Connecting to WiFi");
+  WiFi.disconnect();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+
+  loadConfigFromNvs();
+
+  // 起動時に画面(Aボタン)を押したままなら設定APへ
+  M5.update();
+  if (M5.BtnA.isPressed()) {
+    Serial.println("[CFG] BtnA held at boot -> config portal");
+    startConfigPortal();  // 戻らない
+  }
+
+  M5.Lcd.print("WiFi");
+  Wifi_setup();
+  M5.Lcd.println("OK");
+
+  wc::beginClock();  // NTP (JST)
+
+  if (MDNS.begin(MDNS_HOST)) {
+    Serial.println("MDNS responder started");
+  }
+  Serial.printf("Go to http://%s/ or http://%s.local/\n",
+                WiFi.localIP().toString().c_str(), MDNS_HOST);
+  M5.Lcd.printf("http://%s\n", WiFi.localIP().toString().c_str());
+  M5.Lcd.printf("%s.local\n", MDNS_HOST);
+
+  registerRoutes();
+
+  // ロール(システムプロンプト) を SPIFFS から復元、なければ既定
+  applyRole(String(kDefaultRole));
+  if (SPIFFS.begin(true)) {
+    File f = SPIFFS.open("/data.json", "r");
+    if (f) {
+      DynamicJsonDocument saved(1024 * 10);
+      if (deserializeJson(saved, f) == DeserializationError::Ok &&
+          saved["messages"].is<JsonArray>() && saved["messages"].size() > 0) {
+        InitBuffer = "";
+        serializeJson(saved, InitBuffer);
+        Serial.println("role loaded from SPIFFS");
+      }
+      f.close();
+    }
+  }
+
+  server.begin();
+  Serial.println("HTTP server started");
+
+  audioLogger = &Serial;
+  mp3 = new AudioGeneratorMP3();
+
+  avatar.setScale(0.4);         // 320x240 -> 128x128 に合わせて縮小
+  avatar.setPosition(-56, -96); // 縮小した顔を画面中央へ
+  avatar.init();
+  avatar.addTask(lipSync, "lipSync");
+  avatar.addTask(servo, "servo");
+
+  delay(1000);
+
+  // 起動あいさつ (スピーカー/鍵の動作確認を兼ねる)
+  g_reply_expression = Expression::Happy;
+  speech_text = "こんにちは、ちびスタックちゃんだよ。「" + WAKE_PHRASE.substring(0, WAKE_PHRASE.indexOf(',') > 0 ? WAKE_PHRASE.indexOf(',') : WAKE_PHRASE.length()) + "」って呼んでね。";
+}
+
+void loop() {
+  M5.update();
+
+  // 画面(Aボタン)長押し3秒 -> 設定APモード
+  if (M5.BtnA.pressedFor(3000)) {
+    startConfigPortal();  // 戻らない
+  }
+
+  // 画面クリック -> 呼びかけ無しですぐ聞く
+  if (M5.BtnA.wasClicked() && !mp3->isRunning() &&
+      speech_text == "" && speech_text_buffer == "") {
+    sw_tone();
+    listen_and_chat(false);
+  }
+
+  // 返答があれば読み上げ開始
+  if (speech_text != "") {
+    avatar.setExpression(g_reply_expression);
+    speech_text_buffer = speech_text;
+    speech_text = "";
+    M5.Mic.end();
+    M5.Speaker.begin();
+    Voicevox_tts((char*)speech_text_buffer.c_str(), (char*)TTS_PARMS.c_str());
+  }
+
+  if (mp3->isRunning()) {
+    if (!mp3->loop()) {
+      stopPlayback();
+      Serial.println("mp3 stop");
+      avatar.setExpression(Expression::Neutral);
+      speech_text_buffer = "";
+      delay(200);
+      M5.Speaker.end();
+      M5.Mic.begin();
+    }
+    delay(1);
+  } else {
+    server.handleClient();
+    // 呼びかけ待ち: 音量トリガ -> Whisper -> 呼びかけワード照合
+    if (wake_enable && speech_text == "" && speech_text_buffer == "") {
+      if (vad_triggered()) {
+        Serial.println("[VAD] triggered");
+        listen_and_chat(true);
+      }
+    }
+    delay(1);  // アイドル時に他タスクへ譲る (Task WDT対策)
+  }
+}
