@@ -915,6 +915,24 @@ void handle_role() {
   server.send(200, "text/html", ROLE_HTML);
 }
 
+// 現在のロール本文をスマホでも読みやすく表示する
+String buildRoleViewHtml(const String& title) {
+  init_chat_doc(InitBuffer.c_str());
+  const char* content = chat_doc["messages"][0]["content"];
+  String roleText = content ? String(content) : "(未設定)";
+  roleText.replace("<", "&lt;");
+  String html = String(HEAD_HTML) +
+    "<body style=\"font-family:sans-serif;background:#111;color:#eee;padding:18px\">"
+    "<h1 style=\"font-size:20px\">" + title + "</h1>"
+    "<div style=\"font-size:17px;line-height:1.9;background:#1d1d22;border-radius:12px;"
+    "padding:16px;white-space:pre-wrap;word-break:break-word\">" + roleText + "</div>"
+    "<p style=\"color:#888;font-size:13px\">※後半の感情タグ・タイマータグのルールは自動追記分です</p>"
+    "<p style=\"line-height:2\"><a style=\"color:#7fb0ff;font-size:17px\" href=\"/role\">ロールを変更する</a>"
+    "　<a style=\"color:#7fb0ff;font-size:17px\" href=\"/\">メニューへ戻る</a></p>"
+    "</body></html>";
+  return html;
+}
+
 void handle_role_set() {
   if (server.method() != HTTP_POST) {
     return;
@@ -924,19 +942,11 @@ void handle_role_set() {
   chatHistory.clear();
   init_chat_doc(InitBuffer.c_str());
   save_json();
-
-  String html = "<html><head><meta charset=\"UTF-8\"></head><body><pre>";
-  serializeJsonPretty(chat_doc, html);
-  html += "</pre><a href=\"/\">戻る</a></body></html>";
-  server.send(200, "text/html", html);
+  server.send(200, "text/html", buildRoleViewHtml("保存しました (現在のロール)"));
 }
 
 void handle_role_get() {
-  init_chat_doc(InitBuffer.c_str());
-  String html = "<html><head><meta charset=\"UTF-8\"></head><body><pre>";
-  serializeJsonPretty(chat_doc, html);
-  html += "</pre><a href=\"/\">戻る</a></body></html>";
-  server.send(200, "text/html", html);
+  server.send(200, "text/html", buildRoleViewHtml("現在のロール"));
 }
 
 bool routes_registered = false;
