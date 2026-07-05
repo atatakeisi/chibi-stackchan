@@ -31,6 +31,7 @@
 #include <WiFiClientSecure.h>
 #include "rootCACertificate.h"
 #include "rootCAgoogle.h"
+#include "rootCAanthropic.h"
 #include <ArduinoJson.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
@@ -70,6 +71,8 @@ WebServer server(80);
 
 //---------------------------------------------
 String GEMINI_API_KEY = "";    // Google Gemini (LLM / conversation)
+String CLAUDE_API_KEY = "";    // Anthropic Claude (会話をClaudeにする場合)
+String AI_PROVIDER = "gemini"; // 会話AI: "gemini" | "claude" (Web UIで切り替え)
 String OPENAI_API_KEY = "";    // OpenAI (Whisper speech-to-text)
 String VOICEVOX_API_KEY = "";  // VoiceVox (text-to-speech)
 String CFG_WIFI_SSID = "";
@@ -77,7 +80,9 @@ String CFG_WIFI_PASS = "";
 
 // 呼びかけ (ウェイクワード)。カンマ/読点区切りで複数登録可。
 String WAKE_PHRASE = "スタックちゃん";
-bool   wake_enable = true;
+// 呼びかけモード: 0=無効(画面タッチのみ) 1=呼びかけワードで起動 2=なんでも返事(ワード不要)
+uint8_t wake_mode = 1;
+bool   wake_enable = true;  // wake_mode != 0 の派生値
 int    vad_threshold = 1500;   // 音量トリガのしきい値 (int16 peak, 200-8000)
 
 // 天気の場所 (Web UI で変更可)
@@ -106,6 +111,9 @@ String InitBuffer = "";
 int GEMINI_LAST_HTTP_CODE = 0;
 
 static const char GEMINI_API_URL[] = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent";
+// Claude Messages API。証明書は rootCAanthropic.h (GTS Root R4/R1) で検証する
+static const char CLAUDE_API_URL[] = "https://api.anthropic.com/v1/messages";
+static const char CLAUDE_MODEL[]   = "claude-haiku-4-5";  // 短い会話用途向けの最安モデル
 
 static const char kBaseChatJson[] = "{\"messages\":[]}";
 static const char kExpressionTagRule[] =
@@ -202,22 +210,34 @@ void loadConfigFromNvs() {
   }
 
   GEMINI_API_KEY   = nvs_get_string("chibi", "gemini");
+  CLAUDE_API_KEY   = nvs_get_string("chibi", "claude");
   OPENAI_API_KEY   = nvs_get_string("chibi", "openai");
   VOICEVOX_API_KEY = nvs_get_string("chibi", "voicevox");
   if (!nofallback) {
     if (GEMINI_API_KEY == "")   GEMINI_API_KEY   = String(GEMINI_APIKEY);
     if (OPENAI_API_KEY == "")   OPENAI_API_KEY   = String(OPENAI_APIKEY);
     if (VOICEVOX_API_KEY == "") VOICEVOX_API_KEY = String(VOICEVOX_APIKEY);
+#ifdef CLAUDE_APIKEY
+    if (CLAUDE_API_KEY == "")   CLAUDE_API_KEY   = String(CLAUDE_APIKEY);
+#endif
   }
+
+  String prov = nvs_get_string("chibi", "provider");
+  if (prov != "") AI_PROVIDER = prov;
+  printf("[AI] provider=%s (claude key %s)\n", AI_PROVIDER.c_str(),
+         CLAUDE_API_KEY == "" ? "未設定" : "設定済み");
 
   String w = nvs_get_string("chibi", "wake");
   if (w != "") WAKE_PHRASE = w;
-  wake_enable = nvs_get_u8_or("chibi", "wake_en", 1) != 0;
+  wake_mode = nvs_get_u8_or("chibi", "wake_en", 1);
+  if (wake_mode > 2) wake_mode = 1;
+  wake_enable = (wake_mode != 0);
   String v = nvs_get_string("chibi", "vad");
   if (v != "") vad_threshold = constrain(v.toInt(), 200, 8000);
   // NOTE: この基板では Serial(HWCDC) の出力がUSBに届かないため printf(IDFコンソール)を使う
-  printf("[WAKE] 呼びかけ起動=%s / 有効ワード=[%s] / VADしきい値=%d\n",
-         wake_enable ? "ON" : "OFF", WAKE_PHRASE.c_str(), vad_threshold);
+  printf("[WAKE] モード=%s / 有効ワード=[%s] / VADしきい値=%d\n",
+         wake_mode == 0 ? "無効" : wake_mode == 2 ? "なんでも返事" : "呼びかけワード",
+         WAKE_PHRASE.c_str(), vad_threshold);
 
   String place = nvs_get_string("chibi", "place");
   if (place != "") WEATHER_PLACE = place;
@@ -254,6 +274,9 @@ static const char CONFIG_HTML[] PROGMEM = R"KEWL(
  <div class="card">
   <b>APIキー</b><br><small>空欄の項目は変更されません。</small>
   <label>Gemini API Key (会話)</label><input id="gemini" name="gemini">
+  <label>Claude API Key (会話をClaudeにする場合)</label><input id="claude" name="claude">
+  <label>会話AI (現在: {{provider}})</label>
+  <select id="provider"><option value="">(変更しない)</option><option value="gemini">Gemini</option><option value="claude">Claude</option></select>
   <label>OpenAI API Key (音声認識 Whisper)</label><input id="openai" name="openai">
   <label>VoiceVox API Key (音声合成)</label><input id="voicevox" name="voicevox">
  </div>
@@ -262,7 +285,7 @@ static const char CONFIG_HTML[] PROGMEM = R"KEWL(
   <label>呼びかけワード (カンマ区切りで複数可)</label>
   <input id="wake" name="wake" placeholder="{{wake}}">
   <label>呼びかけ起動</label>
-  <select id="wake_en"><option value="1" {{wen1}}>有効</option><option value="0" {{wen0}}>無効 (画面タッチのみ)</option></select>
+  <select id="wake_en"><option value="1" {{wen1}}>呼びかけワードで起動</option><option value="2" {{wen2}}>なんでも返事 (ワード不要・誤反応は増える)</option><option value="0" {{wen0}}>無効 (画面タッチのみ)</option></select>
   <label>音量トリガ感度 (200=敏感 〜 8000=鈍感)</label>
   <input id="vad" name="vad" type="number" min="200" max="8000" placeholder="{{vad}}">
  </div>
@@ -285,7 +308,7 @@ static const char CONFIG_HTML[] PROGMEM = R"KEWL(
  function save(e){
   e.preventDefault();
   const f=new FormData();
-  for(const id of ["ssid","pass","gemini","openai","voicevox","wake","wake_en","vad","speaker","volume","mic","place","lat","lon"]){
+  for(const id of ["ssid","pass","gemini","claude","provider","openai","voicevox","wake","wake_en","vad","speaker","volume","mic","place","lat","lon"]){
    const v=document.getElementById(id).value;
    if(v!=="") f.append(id,v);
   }
@@ -341,9 +364,11 @@ void handleNotFound() {
 void handle_config() {
   String html = FPSTR(CONFIG_HTML);
   html.replace("{{ssid}}", CFG_WIFI_SSID == "" ? "(未設定)" : CFG_WIFI_SSID);
+  html.replace("{{provider}}", AI_PROVIDER == "claude" ? "Claude" : "Gemini");
   html.replace("{{wake}}", WAKE_PHRASE);
-  html.replace("{{wen1}}", wake_enable ? "selected" : "");
-  html.replace("{{wen0}}", wake_enable ? "" : "selected");
+  html.replace("{{wen1}}", wake_mode == 1 ? "selected" : "");
+  html.replace("{{wen2}}", wake_mode == 2 ? "selected" : "");
+  html.replace("{{wen0}}", wake_mode == 0 ? "selected" : "");
   html.replace("{{vad}}", String(vad_threshold));
   html.replace("{{speaker}}", TTS_SPEAKER_NO);
   html.replace("{{volume}}", String(M5.Speaker.getVolume()));
@@ -365,10 +390,12 @@ void handle_config_set() {
     nvs_set_string("wifi", "pass", server.arg("pass"));  // 空=オープンネットワーク
   }
   if (server.arg("gemini") != "")   nvs_set_string("chibi", "gemini", server.arg("gemini"));
+  if (server.arg("claude") != "")   nvs_set_string("chibi", "claude", server.arg("claude"));
+  if (server.arg("provider") != "") nvs_set_string("chibi", "provider", server.arg("provider"));
   if (server.arg("openai") != "")   nvs_set_string("chibi", "openai", server.arg("openai"));
   if (server.arg("voicevox") != "") nvs_set_string("chibi", "voicevox", server.arg("voicevox"));
   if (server.arg("wake") != "")     nvs_set_string("chibi", "wake", server.arg("wake"));
-  if (server.arg("wake_en") != "")  nvs_set_u8v("chibi", "wake_en", server.arg("wake_en").toInt() ? 1 : 0);
+  if (server.arg("wake_en") != "")  nvs_set_u8v("chibi", "wake_en", constrain(server.arg("wake_en").toInt(), 0, 2));
   if (server.arg("vad") != "")      nvs_set_string("chibi", "vad", server.arg("vad"));
   if (server.arg("place") != "")    nvs_set_string("chibi", "place", server.arg("place"));
   if (server.arg("lat") != "")      nvs_set_string("chibi", "lat", server.arg("lat"));
@@ -630,6 +657,131 @@ String processTimerTag(String s) {
   return s;
 }
 
+// Claude (Anthropic) 用 HTTPS POST。APIキーはURLではなくヘッダで渡す
+String https_post_json_claude(const char* url, const char* json_string,
+                              const char* root_ca, const char* api_key) {
+  String payload = "";
+  GEMINI_LAST_HTTP_CODE = 0;
+  WiFiClientSecure *client = new WiFiClientSecure;
+  if (client) {
+    client->setCACert(root_ca);
+    {
+      HTTPClient https;
+      https.setTimeout(65000);
+      printf("[HTTPS] Claude begin...\n");
+      if (https.begin(*client, url)) {
+        for (int retry = 0; retry < 3; retry++) {
+          https.addHeader("Content-Type", "application/json");
+          https.addHeader("x-api-key", api_key);
+          https.addHeader("anthropic-version", "2023-06-01");
+          int httpCode = https.POST((uint8_t *)json_string, strlen(json_string));
+          if (httpCode > 0) {
+            GEMINI_LAST_HTTP_CODE = httpCode;
+            printf("[HTTPS] Claude POST code: %d\n", httpCode);
+            if (httpCode == HTTP_CODE_OK) {
+              payload = https.getString();
+              break;
+            }
+            String errorPayload = https.getString();
+            if (errorPayload != "") printf("[HTTPS] error: %s\n", errorPayload.c_str());
+            // 429=レート制限 / 529=過負荷 は少し待ってリトライ
+            if ((httpCode == 429 || httpCode == 529) && retry < 2) {
+              delay(1200 * (retry + 1));
+              continue;
+            }
+            break;
+          } else {
+            printf("[HTTPS] Claude POST failed: %s\n", https.errorToString(httpCode).c_str());
+            break;
+          }
+        }
+        https.end();
+      }
+    }
+    delete client;
+  }
+  return payload;
+}
+
+// chat_doc ({"messages":[{role,content},...]}) から Claude Messages API のリクエストを作る。
+// Claude は system をメッセージ列と別枠で渡す点が Gemini と異なる。
+String buildClaudeRequestFromChatJson(const String& json_string) {
+  DynamicJsonDocument inDoc(1024 * 10);
+  if (deserializeJson(inDoc, json_string) != DeserializationError::Ok) return "";
+  DynamicJsonDocument outDoc(1024 * 12);
+  outDoc["model"] = CLAUDE_MODEL;
+  outDoc["max_tokens"] = 300;  // 返答は60文字程度なので十分
+  JsonArray msgs = outDoc.createNestedArray("messages");
+  for (JsonObject m : inDoc["messages"].as<JsonArray>()) {
+    const char* role = m["role"];
+    const char* content = m["content"];
+    if (!role || !content) continue;
+    if (strcmp(role, "system") == 0) {
+      outDoc["system"] = content;
+    } else {
+      JsonObject o = msgs.createNestedObject();
+      o["role"] = (strcmp(role, "assistant") == 0) ? "assistant" : "user";
+      o["content"] = content;
+    }
+  }
+  if (msgs.size() == 0) return "";
+  String out;
+  serializeJson(outDoc, out);
+  return out;
+}
+
+String chatClaude(String json_string) {
+  String response = "";
+  avatar.setExpression(Expression::Doubt);  // 考え中
+  if (CLAUDE_API_KEY == "") {
+    avatar.setExpression(Expression::Neutral);
+    return "クロードのエーピーアイキーが設定されていません。設定画面から入力してね。";
+  }
+  String req = buildClaudeRequestFromChatJson(json_string);
+  if (req == "") {
+    avatar.setExpression(Expression::Sad);
+    delay(1000);
+    avatar.setExpression(Expression::Neutral);
+    return "エラーです";
+  }
+  String ret = https_post_json_claude(CLAUDE_API_URL, req.c_str(),
+                                      root_ca_anthropic, CLAUDE_API_KEY.c_str());
+  avatar.setExpression(Expression::Neutral);
+  printf("%s\n", ret.c_str());
+  if (ret != "") {
+    DynamicJsonDocument doc(8000);
+    if (deserializeJson(doc, ret.c_str()) != DeserializationError::Ok) {
+      avatar.setExpression(Expression::Sad);
+      response = "エラーです";
+      delay(1000);
+      avatar.setExpression(Expression::Neutral);
+    } else {
+      const char* data = doc["content"][0]["text"];
+      if (data) {
+        response = String(data);
+        std::replace(response.begin(), response.end(), '\n', ' ');
+        g_reply_expression = pickExpression(response);
+        response = stripExpressionTag(response);
+        response = processTimerTag(response);
+      } else {
+        response = "わかりません";
+      }
+    }
+  } else {
+    avatar.setExpression(Expression::Sad);
+    if (GEMINI_LAST_HTTP_CODE == 429 || GEMINI_LAST_HTTP_CODE == 529) {
+      response = "ただいま混み合っています。少し待ってからもう一度話しかけてね。";
+    } else if (GEMINI_LAST_HTTP_CODE == 401 || GEMINI_LAST_HTTP_CODE == 403) {
+      response = "クロードのエーピーアイキーが正しくないみたい。設定を確認してね。";
+    } else {
+      response = "わかりません";
+    }
+    delay(1000);
+    avatar.setExpression(Expression::Neutral);
+  }
+  return response;
+}
+
 String chatGemini(String json_string) {
   String response = "";
   avatar.setExpression(Expression::Doubt);  // 考え中
@@ -792,7 +944,8 @@ String exec_chat(String text) {
   String json_string;
   serializeJson(chat_doc, json_string);
 
-  String response = chatGemini(json_string);
+  String response = (AI_PROVIDER == "claude") ? chatClaude(json_string)
+                                              : chatGemini(json_string);
   speech_text = response;
   chatHistory.push_back(response);
   return response;
@@ -1386,28 +1539,35 @@ void listen_and_chat(bool require_wake) {
     int matchLen = 0;
     int idx = findWakePhrase(ret, &matchLen);
     if (idx < 0) {
-      printf("呼びかけワードなし -> 無視 (有効ワード: [%s])\n", WAKE_PHRASE.c_str());
-      showFaceState(FACE_IDLE);
-      return;
-    }
-    printf("呼びかけ検出: [%s]\n", ret.substring(idx, idx + matchLen).c_str());
-    String rest = stripLeadingPunct(ret.substring(idx + matchLen));
-    if (rest.length() < 6) {  // 呼びかけのみ (日本語2文字未満) -> 聞き返す
-      g_reply_expression = Expression::Happy;
-      avatar.setExpression(Expression::Happy);
-      showFaceState(FACE_IDLE);
-      speakBlocking("なあに？");
-      ret = SpeechToText();
-      if (ret == "" || isWhisperHallucination(ret)) {
+      if (wake_mode != 2) {
+        printf("呼びかけワードなし -> 無視 (有効ワード: [%s])\n", WAKE_PHRASE.c_str());
         showFaceState(FACE_IDLE);
-        avatar.setExpression(Expression::Sad);
-        delay(1500);
-        avatar.setExpression(Expression::Neutral);
         return;
       }
-      printf("音声認識結果(2): %s\n", ret.c_str());
-    } else {
-      ret = rest;
+      // なんでも返事モード: ワードが無くても認識テキスト全体を質問として扱う
+      printf("呼びかけワードなし -> なんでも返事モードで続行\n");
+      idx = -1;
+    }
+    if (idx >= 0) {  // 呼びかけワードが見つかった場合はワード部分を除去
+      printf("呼びかけ検出: [%s]\n", ret.substring(idx, idx + matchLen).c_str());
+      String rest = stripLeadingPunct(ret.substring(idx + matchLen));
+      if (rest.length() < 6) {  // 呼びかけのみ (日本語2文字未満) -> 聞き返す
+        g_reply_expression = Expression::Happy;
+        avatar.setExpression(Expression::Happy);
+        showFaceState(FACE_IDLE);
+        speakBlocking("なあに？");
+        ret = SpeechToText();
+        if (ret == "" || isWhisperHallucination(ret)) {
+          showFaceState(FACE_IDLE);
+          avatar.setExpression(Expression::Sad);
+          delay(1500);
+          avatar.setExpression(Expression::Neutral);
+          return;
+        }
+        printf("音声認識結果(2): %s\n", ret.c_str());
+      } else {
+        ret = rest;
+      }
     }
   }
 
