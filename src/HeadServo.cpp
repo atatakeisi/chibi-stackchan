@@ -5,7 +5,7 @@ namespace head {
 namespace {
 
 constexpr int      kLedcCh   = 4;      // M5.Speaker/Avatar と被らないチャネル
-constexpr int      kLedcBits = 16;
+constexpr int      kLedcBits = 14;     // ESP32-S3 の LEDC は最大14ビット (16だと初期化失敗)
 constexpr int      kLedcFreq = 50;     // 50Hz (20ms)
 constexpr uint32_t kPulseMinUs = 500;  // 0deg
 constexpr uint32_t kPulseMaxUs = 2400; // 180deg

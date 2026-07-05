@@ -110,6 +110,14 @@ static const char GEMINI_API_URL[] = "https://generativelanguage.googleapis.com/
 static const char kBaseChatJson[] = "{\"messages\":[]}";
 static const char kExpressionTagRule[] =
     "返答の先頭に感情タグを1つだけ付けてください: [happy] [sad] [angry] [sleepy] [doubt] [neutral]";
+static const char kTimerTagRule[] =
+    "タイマーを頼まれたら返答の最後に [timer:秒数] を付けてください (例: 3分なら [timer:180])。"
+    "タイマーの中止を頼まれたら [timer:cancel] を、残り時間を聞かれたら [timer:status] を付けてください。"
+    "タイマーと関係ない話ではこれらのタグを付けないでください。";
+
+// タイマー ([timer:秒] タグでセット、満了時に読み上げ)
+uint32_t timer_end_ms = 0;    // 0 = 未設定
+uint32_t timer_total_sec = 0;
 static const char kDefaultRole[] =
     "あなたは「ちびスタックちゃん」という小さくてかわいいロボットです。"
     "一人称は「ぼく」。日本語で、話し言葉で短く(60文字以内で)答えてください。";
@@ -129,7 +137,7 @@ void applyRole(const String& roleText) {
   JsonArray messages = chat_doc["messages"];
   JsonObject m = messages.createNestedObject();
   m["role"] = "system";
-  m["content"] = roleText + "\n" + kExpressionTagRule;
+  m["content"] = roleText + "\n" + kExpressionTagRule + "\n" + kTimerTagRule;
   InitBuffer = "";
   serializeJson(chat_doc, InitBuffer);
 }
@@ -573,6 +581,55 @@ String stripExpressionTag(String s) {
   return s;
 }
 
+// 秒数を「◯分◯秒」の読み上げ形式に
+String formatDuration(uint32_t sec) {
+  String m = "";
+  if (sec >= 60) {
+    m = String(sec / 60) + "分";
+    if (sec % 60) m += String(sec % 60) + "秒";
+  } else {
+    m = String(sec) + "秒";
+  }
+  return m;
+}
+
+// Gemini返答中の [timer:...] タグを実行し、文面から除去する
+String processTimerTag(String s) {
+  int i = s.indexOf("[timer:");
+  if (i < 0) return s;
+  int e = s.indexOf(']', i);
+  if (e < 0) return s;
+  String arg = s.substring(i + 7, e);
+  arg.trim();
+  s.remove(i, e - i + 1);
+  s.trim();
+  if (arg == "cancel") {
+    timer_end_ms = 0;
+    if (s == "") s = "タイマーをやめたよ";
+    printf("[TIMER] cancel\n");
+  } else if (arg == "status") {
+    if (timer_end_ms == 0) {
+      s = "いまタイマーは動いてないよ";
+    } else {
+      uint32_t rem = (timer_end_ms - millis() + 999) / 1000;
+      s = "あと" + formatDuration(rem) + "だよ";  // 残りはこちらで計算して答える
+    }
+  } else {
+    long sec = arg.toInt();
+    if (sec > 0) {
+      if (sec > 12L * 3600) sec = 12L * 3600;  // 上限12時間
+      const bool replaced = (timer_end_ms != 0);  // 動作中のタイマーを上書き
+      timer_total_sec = (uint32_t)sec;
+      timer_end_ms = millis() + (uint32_t)sec * 1000UL;
+      if (timer_end_ms == 0) timer_end_ms = 1;  // 0 は「未設定」の意味なので回避
+      if (s == "") s = formatDuration(sec) + "のタイマーをセットしたよ";
+      else if (replaced) s += "。前のタイマーはやめてセットし直したよ";
+      printf("[TIMER] set %ld sec%s\n", sec, replaced ? " (replaced)" : "");
+    }
+  }
+  return s;
+}
+
 String chatGemini(String json_string) {
   String response = "";
   avatar.setExpression(Expression::Doubt);  // 考え中
@@ -605,6 +662,7 @@ String chatGemini(String json_string) {
         std::replace(response.begin(), response.end(), '\n', ' ');
         g_reply_expression = pickExpression(response);
         response = stripExpressionTag(response);
+        response = processTimerTag(response);
       } else {
         response = "わかりません";
       }
@@ -626,7 +684,84 @@ String chatGemini(String json_string) {
 
 // 質問に「現在日時」+ (天気の話題なら)「今日の天気」を参考情報として添付し、
 // Gemini に投げる。返答は speech_text 経由で読み上げられる。
+// 数字列 + 時間/分/秒 の並びから合計秒数を取り出す (見つからなければ0)。
+// 「三分」等の漢数字と「三十」のような十の位も簡易対応。
+uint32_t parseDurationSec(const String& in) {
+  String t = in;
+  const char* kanji[] = {"〇", "一", "二", "三", "四", "五", "六", "七", "八", "九"};
+  for (int d = 0; d <= 9; d++) t.replace(kanji[d], String(d));
+  int i;
+  while ((i = t.indexOf("十")) >= 0) {  // a十b -> a*10+b (aは省略で1, bは省略で0)
+    int a = 1, b = 0, start = i, end = i + 3;
+    if (i >= 1 && isDigit(t[i - 1])) { a = t[i - 1] - '0'; start = i - 1; }
+    if ((int)t.length() > i + 3 && isDigit(t[i + 3])) { b = t[i + 3] - '0'; end = i + 4; }
+    t = t.substring(0, start) + String(a * 10 + b) + t.substring(end);
+  }
+  uint32_t total = 0;
+  const int n = t.length();
+  i = 0;
+  while (i < n) {
+    if (isDigit(t[i])) {
+      long v = 0;
+      int j = i;
+      while (j < n && isDigit(t[j])) { v = v * 10 + (t[j] - '0'); j++; }
+      if (t.startsWith("時間", j))     { total += v * 3600; j += 6; }
+      else if (t.startsWith("分", j))  { total += v * 60;   j += 3; }
+      else if (t.startsWith("秒", j))  { total += v;        j += 3; }
+      i = j;
+    } else {
+      i++;
+    }
+  }
+  return total;
+}
+
+// タイマー系の定型コマンドを本体だけで処理する (Gemini混雑・圏外でも動くように)。
+// 処理したら speech_text をセットして true を返す。
+bool tryLocalTimerCommand(const String& text) {
+  const bool mentionsTimer = (text.indexOf("タイマー") >= 0) || (text.indexOf("たいまー") >= 0);
+  if (mentionsTimer && (text.indexOf("やめ") >= 0 || text.indexOf("止め") >= 0 ||
+                        text.indexOf("ストップ") >= 0 || text.indexOf("キャンセル") >= 0 ||
+                        text.indexOf("中止") >= 0)) {
+    timer_end_ms = 0;
+    g_reply_expression = Expression::Neutral;
+    speech_text = "タイマーをやめたよ";
+    printf("[TIMER] cancel (local)\n");
+    return true;
+  }
+  if (mentionsTimer && (text.indexOf("あと") >= 0 || text.indexOf("残り") >= 0 ||
+                        text.indexOf("何分") >= 0 || text.indexOf("何秒") >= 0)) {
+    g_reply_expression = Expression::Neutral;
+    speech_text = (timer_end_ms == 0)
+        ? String("いまタイマーは動いてないよ")
+        : "あと" + formatDuration((timer_end_ms - millis() + 999) / 1000) + "だよ";
+    return true;
+  }
+  const bool asksMeasure = mentionsTimer || text.indexOf("はかって") >= 0 ||
+                           text.indexOf("計って") >= 0 || text.indexOf("測って") >= 0;
+  if (asksMeasure) {
+    uint32_t sec = parseDurationSec(text);
+    if (sec > 0) {
+      if (sec > 12UL * 3600) sec = 12UL * 3600;
+      const bool replaced = (timer_end_ms != 0);  // 動作中のタイマーを上書き
+      timer_total_sec = sec;
+      timer_end_ms = millis() + sec * 1000UL;
+      if (timer_end_ms == 0) timer_end_ms = 1;
+      g_reply_expression = Expression::Happy;
+      speech_text = formatDuration(sec) + "のタイマーに" +
+                    (replaced ? "セットし直したよ" : "セットしたよ");
+      printf("[TIMER] set %u sec (local%s)\n", (unsigned)sec, replaced ? ", replaced" : "");
+      return true;
+    }
+  }
+  return false;
+}
+
 String exec_chat(String text) {
+  // タイマー系の定型はGeminiを介さず即応答 (混雑時でも確実に動く)
+  if (tryLocalTimerCommand(text)) {
+    return speech_text;
+  }
   init_chat_doc(InitBuffer.c_str());
   chatHistory.push_back(text);
   if (chatHistory.size() > MAX_HISTORY * 2) {
@@ -1467,6 +1602,15 @@ void loop() {
       speech_text == "" && speech_text_buffer == "") {
     sw_tone();
     listen_and_chat(false);
+  }
+
+  // タイマー満了 → 会話や再生と重ならないタイミングでアナウンス
+  if (timer_end_ms != 0 && (int32_t)(millis() - timer_end_ms) >= 0 &&
+      speech_text == "" && speech_text_buffer == "" && !mp3->isRunning()) {
+    timer_end_ms = 0;
+    g_reply_expression = Expression::Happy;
+    speech_text = "ピピピッ、ピピピッ！" + formatDuration(timer_total_sec) + "たったよ！";
+    printf("[TIMER] fired\n");
   }
 
   // 返答があれば読み上げ開始
