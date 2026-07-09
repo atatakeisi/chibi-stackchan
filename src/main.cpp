@@ -83,7 +83,7 @@ String WAKE_PHRASE = "スタックちゃん";
 // 呼びかけモード: 0=無効(画面タッチのみ) 1=呼びかけワードで起動 2=なんでも返事(ワード不要)
 uint8_t wake_mode = 1;
 bool   wake_enable = true;  // wake_mode != 0 の派生値
-int    vad_threshold = 1500;   // 音量トリガのしきい値 (int16 peak, 200-8000)
+int    vad_threshold = 5000;   // 音量トリガのしきい値 (int16 peak, 200-8000)。実機調整済みの値
 
 // 天気の場所 (Web UI で変更可)
 String WEATHER_PLACE = "東京";
@@ -910,6 +910,15 @@ bool tryLocalTimerCommand(const String& text) {
 }
 
 String exec_chat(String text) {
+  // ローカルコマンド: IPアドレス読み上げ (画面表示が小さくて読めない時用)
+  if (text.indexOf("アイピー") >= 0 || text.indexOf("IPアドレス") >= 0 ||
+      text.indexOf("IP アドレス") >= 0) {
+    String ip = WiFi.localIP().toString();
+    ip.replace(".", "、てん、");
+    g_reply_expression = Expression::Happy;
+    speech_text = "ぼくのアイピーアドレスは、" + ip + "、だよ";
+    return speech_text;
+  }
   // タイマー系の定型はGeminiを介さず即応答 (混雑時でも確実に動く)
   if (tryLocalTimerCommand(text)) {
     return speech_text;
@@ -1657,7 +1666,7 @@ void setup() {
     auto micConfig = M5.Mic.config();
     micConfig.stereo = false;
     micConfig.sample_rate = 16000;
-    uint8_t micgain = nvs_get_u8_or("setting", "micgain", 0);
+    uint8_t micgain = nvs_get_u8_or("setting", "micgain", 16);  // 既定16 (音割れしにくい実機調整値)
     if (micgain > 0) micConfig.magnification = micgain;
     M5.Mic.config(micConfig);
     printf("[MIC] magnification=%d\n", micConfig.magnification);
@@ -1669,7 +1678,7 @@ void setup() {
   // 音量・話者番号を NVS から (初回は既定値を書き込み)
   {
     uint32_t nvs_handle;
-    size_t volume = 200;
+    size_t volume = 100;    // 実機調整済みの既定値
     uint8_t speaker_no = 3;
     if (ESP_OK == nvs_open("setting", NVS_READONLY, &nvs_handle)) {
       nvs_get_u32(nvs_handle, "volume", &volume);
@@ -1678,7 +1687,7 @@ void setup() {
     } else if (ESP_OK == nvs_open("setting", NVS_READWRITE, &nvs_handle)) {
       nvs_set_u32(nvs_handle, "volume", volume);
       nvs_set_u8(nvs_handle, "speaker", speaker_no);
-      nvs_set_u8(nvs_handle, "micgain", 32);
+      nvs_set_u8(nvs_handle, "micgain", 16);
       nvs_close(nvs_handle);
     }
     if (volume > 255) volume = 255;
@@ -1715,8 +1724,21 @@ void setup() {
   }
   Serial.printf("Go to http://%s/ or http://%s.local/\n",
                 WiFi.localIP().toString().c_str(), MDNS_HOST);
-  M5.Lcd.printf("http://%s\n", WiFi.localIP().toString().c_str());
-  M5.Lcd.printf("%s.local\n", MDNS_HOST);
+  // IPアドレスを大きく数秒表示 (128x128でも読めるように2行に分割)
+  {
+    String ip = WiFi.localIP().toString();
+    int dot2 = ip.indexOf('.', ip.indexOf('.') + 1);  // 2個目のドット
+    M5.Lcd.fillScreen(TFT_BLACK);
+    M5.Lcd.setTextSize(2);
+    M5.Lcd.setCursor(0, 16);
+    M5.Lcd.println("IP:");
+    M5.Lcd.println(ip.substring(0, dot2 + 1));
+    M5.Lcd.println(ip.substring(dot2 + 1));
+    M5.Lcd.setTextSize(1);
+    M5.Lcd.printf("\n %s.local", MDNS_HOST);
+    delay(3500);  // 読む時間。「アイピー教えて」でも読み上げ可
+    M5.Lcd.setTextSize(1);
+  }
 
   registerRoutes();
 
