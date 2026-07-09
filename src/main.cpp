@@ -335,7 +335,7 @@ button{font-size:17px;padding:12px 18px;margin-top:12px;border:0;border-radius:1
 </head><body>
 <h1>ロール設定</h1>
 <p>キャラ設定(システムプロンプト)を入力。空で送ると既定に戻ります。<br>
-感情タグのルールは自動で追記されます。</p>
+<span style="color:#e6b34d">感情タグ・タイマータグのルールは自動で追記されます (書かなくてOK)。</span></p>
 <form onsubmit="postData(event)">
  <textarea id="textarea"></textarea><br>
  <button type="submit">送信</button>
@@ -1077,18 +1077,28 @@ void handle_role() {
   server.send(200, "text/html", ROLE_HTML);
 }
 
-// 現在のロール本文をスマホでも読みやすく表示する
+// 現在のロール本文をスマホでも読みやすく表示する。
+// 自動追記される固定ルール (感情タグ・タイマータグ) は琥珀色で区別する。
 String buildRoleViewHtml(const String& title) {
   init_chat_doc(InitBuffer.c_str());
   const char* content = chat_doc["messages"][0]["content"];
   String roleText = content ? String(content) : "(未設定)";
   roleText.replace("<", "&lt;");
+  String rules = String(kExpressionTagRule);  // 自動追記はここから始まる
+  rules.replace("<", "&lt;");
+  int idx = roleText.indexOf(rules);
+  if (idx >= 0) {
+    roleText = roleText.substring(0, idx) +
+               "<span style=\"color:#e6b34d\">" + roleText.substring(idx) + "</span>";
+  }
   String html = String(HEAD_HTML) +
     "<body style=\"font-family:sans-serif;background:#111;color:#eee;padding:18px\">"
     "<h1 style=\"font-size:20px\">" + title + "</h1>"
     "<div style=\"font-size:17px;line-height:1.9;background:#1d1d22;border-radius:12px;"
     "padding:16px;white-space:pre-wrap;word-break:break-word\">" + roleText + "</div>"
-    "<p style=\"color:#888;font-size:13px\">※後半の感情タグ・タイマータグのルールは自動追記分です</p>"
+    "<p style=\"color:#888;font-size:13px\">※<span style=\"color:#e6b34d\">色付き部分</span>は"
+    "表情・タイマー機能を動かすために本体が自動追記する固定ルールです。"
+    "ロール変更時に入力する必要はありません (キャラ設定の文章だけでOK)</p>"
     "<p style=\"line-height:2\"><a style=\"color:#7fb0ff;font-size:17px\" href=\"/role\">ロールを変更する</a>"
     "　<a style=\"color:#7fb0ff;font-size:17px\" href=\"/\">メニューへ戻る</a></p>"
     "</body></html>";
