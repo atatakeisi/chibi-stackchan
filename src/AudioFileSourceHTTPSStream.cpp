@@ -113,7 +113,8 @@ retry:
 
   if (!nonBlock) {
     int start = millis();
-    while ((stream->available() < (int)len) && (millis() - start < 500)) yield();
+    // yield() だとビジーループでCPU100%になるため delay で他タスクへ譲る
+    while ((stream->available() < (int)len) && (millis() - start < 500)) delay(1);
   }
 
   size_t avail = stream->available();

@@ -22,6 +22,7 @@
 
 #include <AudioOutput.h>
 #include <AudioFileSourceBuffer.h>
+#include <AudioFileSourceSPIFFS.h>
 #include <AudioGeneratorMP3.h>
 #include "AudioFileSourceHTTPSStream.h"
 #include "AudioOutputM5Speaker.h"
@@ -291,7 +292,70 @@ static const char CONFIG_HTML[] PROGMEM = R"KEWL(
  </div>
  <div class="card">
   <b>声・音</b>
-  <label>VoiceVox 話者番号 (0-60)</label><input id="speaker" type="number" min="0" max="60" placeholder="{{speaker}}">
+  <label>VoiceVox 話者 (現在の声が選択されています)</label>
+  <select id="speaker">
+   <option value="0">0: 四国めたん (あまあま)</option>
+   <option value="1">1: ずんだもん (あまあま)</option>
+   <option value="2">2: 四国めたん (ノーマル)</option>
+   <option value="3">3: ずんだもん (ノーマル)</option>
+   <option value="4">4: 四国めたん (セクシー)</option>
+   <option value="5">5: ずんだもん (セクシー)</option>
+   <option value="6">6: 四国めたん (ツンツン)</option>
+   <option value="7">7: ずんだもん (ツンツン)</option>
+   <option value="8">8: 春日部つむぎ</option>
+   <option value="9">9: 波音リツ</option>
+   <option value="10">10: 雨晴はう</option>
+   <option value="11">11: 玄野武宏 (ノーマル)</option>
+   <option value="12">12: 白上虎太郎 (ふつう)</option>
+   <option value="13">13: 青山龍星</option>
+   <option value="14">14: 冥鳴ひまり</option>
+   <option value="15">15: 九州そら (あまあま)</option>
+   <option value="16">16: 九州そら (ノーマル)</option>
+   <option value="17">17: 九州そら (セクシー)</option>
+   <option value="18">18: 九州そら (ツンツン)</option>
+   <option value="19">19: 九州そら (ささやき)</option>
+   <option value="20">20: もち子さん</option>
+   <option value="21">21: 剣崎雌雄</option>
+   <option value="22">22: ずんだもん (ささやき)</option>
+   <option value="23">23: WhiteCUL (ノーマル)</option>
+   <option value="24">24: WhiteCUL (たのしい)</option>
+   <option value="25">25: WhiteCUL (かなしい)</option>
+   <option value="26">26: WhiteCUL (びえーん)</option>
+   <option value="27">27: 後鬼 (人間ver.)</option>
+   <option value="28">28: 後鬼 (ぬいぐるみver.)</option>
+   <option value="29">29: No.7 (ノーマル)</option>
+   <option value="30">30: No.7 (アナウンス)</option>
+   <option value="31">31: No.7 (読み聞かせ)</option>
+   <option value="32">32: 白上虎太郎 (わーい)</option>
+   <option value="33">33: 白上虎太郎 (びくびく)</option>
+   <option value="34">34: 白上虎太郎 (おこ)</option>
+   <option value="35">35: 白上虎太郎 (びえーん)</option>
+   <option value="36">36: 四国めたん (ささやき)</option>
+   <option value="37">37: 四国めたん (ヒソヒソ)</option>
+   <option value="38">38: ずんだもん (ヒソヒソ)</option>
+   <option value="39">39: 玄野武宏 (喜び)</option>
+   <option value="40">40: 玄野武宏 (ツンギレ)</option>
+   <option value="41">41: 玄野武宏 (悲しみ)</option>
+   <option value="42">42: ちび式じい</option>
+   <option value="43">43: 櫻歌ミコ (ノーマル)</option>
+   <option value="44">44: 櫻歌ミコ (第二形態)</option>
+   <option value="45">45: 櫻歌ミコ (ロリ)</option>
+   <option value="46">46: 小夜/SAYO</option>
+   <option value="47">47: ナースロボ タイプT (ノーマル)</option>
+   <option value="48">48: ナースロボ タイプT (楽々)</option>
+   <option value="49">49: ナースロボ タイプT (恐怖)</option>
+   <option value="50">50: ナースロボ タイプT (内緒話)</option>
+   <option value="51">51: 聖騎士 紅桜</option>
+   <option value="52">52: 雀松朱司</option>
+   <option value="53">53: 麒ヶ島宗麟</option>
+   <option value="54">54: 春歌ナナ</option>
+   <option value="55">55: 猫使アル (ノーマル)</option>
+   <option value="56">56: 猫使アル (おちつき)</option>
+   <option value="57">57: 猫使アル (うきうき)</option>
+   <option value="58">58: 猫使ビィ (ノーマル)</option>
+   <option value="59">59: 猫使ビィ (おちつき)</option>
+   <option value="60">60: 猫使ビィ (人見知り)</option>
+  </select>
   <label>スピーカー音量 (0-255)</label><input id="volume" type="number" min="0" max="255" placeholder="{{volume}}">
   <label>マイク感度 (1-255)</label><input id="mic" type="number" min="1" max="255" placeholder="{{mic}}">
  </div>
@@ -305,6 +369,7 @@ static const char CONFIG_HTML[] PROGMEM = R"KEWL(
 </form>
 <button class="danger" onclick="clearKeys()">鍵情報クリア (Wi-Fi・APIキーを消去)</button>
 <script>
+ document.getElementById("speaker").value="{{speaker}}";
  function save(e){
   e.preventDefault();
   const f=new FormData();
@@ -1148,6 +1213,7 @@ AudioFileSourceBuffer *buff = nullptr;
 int preallocateBufferSize = 30 * 1024;
 uint8_t *preallocateBuffer;
 AudioFileSourceHTTPSStream *file = nullptr;
+AudioFileSourceSPIFFS *sfile = nullptr;  // SPIFFSキャッシュ再生用 (起床ボイス等)
 
 void playMP3(AudioFileSourceBuffer *buff) {
   mp3->begin(buff, &out);
@@ -1166,6 +1232,7 @@ void stopPlayback() {
   if (mp3->isRunning()) mp3->stop();
   if (buff != nullptr) { delete buff; buff = nullptr; }
   if (file != nullptr) { delete file; file = nullptr; }
+  if (sfile != nullptr) { delete sfile; sfile = nullptr; }
 }
 
 // TTS を再生し終わるまでブロックする ("なあに？" 等の短い相槌用)
@@ -1183,6 +1250,49 @@ void speakBlocking(const String& text) {
   delay(200);
   M5.Speaker.end();
   M5.Mic.begin();
+}
+
+// ====================================================================
+//  おやすみ / 起床 (3分会話が無いと眠り、声で起きる)
+// ====================================================================
+constexpr uint32_t kSleepAfterMs = 3UL * 60UL * 1000UL;
+static const char kWakeUpSpeech[]  = "じいいいいええええ！寝てしまった！";
+static const char kWakeVoicePath[] = "/wake.mp3";  // SPIFFSキャッシュ (ネット不要で即発声)
+uint32_t last_activity_ms = 0;  // 最後に「会話」があった時刻 (認識成功/発話/ボタン)
+bool sleeping = false;
+
+// SPIFFS にキャッシュした MP3 を再生し終わるまでブロック。無ければ false
+bool speakFromSPIFFS(const char* path) {
+  if (!SPIFFS.begin(true) || !SPIFFS.exists(path)) return false;
+  M5.Mic.end();
+  M5.Speaker.begin();
+  sfile = new AudioFileSourceSPIFFS(path);
+  buff = new AudioFileSourceBuffer(sfile, preallocateBuffer, preallocateBufferSize);
+  mp3->begin(buff, &out);
+  uint32_t start = millis();
+  while (mp3->isRunning() && millis() - start < 15000) {
+    if (!mp3->loop()) break;
+    delay(1);
+  }
+  stopPlayback();
+  delay(200);
+  M5.Speaker.end();
+  M5.Mic.begin();
+  return true;
+}
+
+// 起床ボイスを SPIFFS にキャッシュする。取得済みで話者も同じなら何もしない。
+// 眠りに入るタイミング (どうせ暇) に呼ぶので、失敗しても起床時に通常TTSで喋れる
+void prepareWakeVoice() {
+  String cachedSpk = nvs_get_string("chibi", "wake_spk");
+  if (cachedSpk == TTS_SPEAKER_NO && SPIFFS.begin(true) && SPIFFS.exists(kWakeVoicePath)) return;
+  printf("[SLEEP] 起床ボイスをキャッシュ中 (話者%s)...\n", TTS_SPEAKER_NO.c_str());
+  if (Voicevox_tts_download(kWakeUpSpeech, TTS_PARMS.c_str(), kWakeVoicePath)) {
+    nvs_set_string("chibi", "wake_spk", TTS_SPEAKER_NO);
+    printf("[SLEEP] 起床ボイス保存OK\n");
+  } else {
+    printf("[SLEEP] 起床ボイス取得失敗 (起床時は通常TTSで喋る)\n");
+  }
 }
 
 // ====================================================================
@@ -1322,6 +1432,11 @@ void showFaceState(FaceState s) {
   avatar.setColorPalette(cp);
 }
 
+// 直近の録音に含まれた「大きい音」の100ms窓の数 (喋りらしさ判定用)。
+// 人の発話ならおおむね4〜35窓 (0.4〜3.5秒) に収まる。
+// 物音は短すぎ、掃除機・音楽などの連続音は長すぎるので除外できる。
+int g_voiced_100ms = 0;
+
 String SpeechToText(bool use_preroll = false) {
   printf("Record start!%s\n", use_preroll ? " (プリロール付き)" : "");
   showFaceState(FACE_LISTENING);
@@ -1335,6 +1450,12 @@ String SpeechToText(bool use_preroll = false) {
     audio->Record(nullptr, 0, vad_threshold);
   }
   showFaceState(FACE_THINKING);
+  if (audio->GetBuffer() == nullptr || audio->GetSize() <= 44) {
+    printf("[REC] 録音バッファ確保失敗\n");
+    g_voiced_100ms = 0;
+    delete audio;
+    return "";
+  }
   // デバッグ: 録音データの振幅を区間別に確認 (無音WAVをWhisperに送っていないか)
   {
     const int16_t* wav = (const int16_t*)(audio->GetBuffer() + 44);
@@ -1347,8 +1468,9 @@ String SpeechToText(bool use_preroll = false) {
     }
     printf("[REC] total=%u pre=%u prePeak=%d livePeak=%d\n",
            (unsigned)total, (unsigned)pre_n, prePeak, livePeak);
-    // 100msごとのピーク一覧 (声がどの時間帯にあるか)
+    // 100msごとのピーク一覧 (声がどの時間帯にあるか) + 大きい音の窓数を数える
     printf("[WAVPROF]");
+    int voiced = 0;
     for (size_t b = 0; b < total; b += 1600) {
       const size_t e = (b + 1600 < total) ? b + 1600 : total;
       int peak = 0;
@@ -1356,9 +1478,11 @@ String SpeechToText(bool use_preroll = false) {
         int v = abs((int)wav[i]);
         if (v > peak) peak = v;
       }
+      if (peak >= vad_threshold) voiced++;
       printf(" %d", peak);
     }
     printf("\n");
+    g_voiced_100ms = voiced;
   }
   printf("Record end. transcribing...\n");
   avatar.setExpression(Expression::Doubt);  // 認識中
@@ -1536,7 +1660,7 @@ void sw_tone() {
 // 録音 → Whisper → (必要なら呼びかけ判定) → Gemini
 // require_wake=true のときは呼びかけワードを含まない発話を無視する。
 void listen_and_chat(bool require_wake) {
-  head::center();
+  head::focus(true);  // 即座に正面で静止し聞き取りに集中 (キョロキョロ中断・サーボ音防止)
   avatar.setExpression(Expression::Happy);  // 聞いてます
   // 呼びかけ起動時はトリガ前0.5秒を録音に前置して語頭欠けを防ぐ
   String ret = SpeechToText(require_wake);
@@ -1545,10 +1669,15 @@ void listen_and_chat(bool require_wake) {
     if (ret != "") printf("音声認識: 幻聴とみなし無視 [%s]\n", ret.c_str());
     else printf("音声認識: 空文字 (無音/認識失敗)\n");
     showFaceState(FACE_IDLE);
-    if (!require_wake) {  // ボタン起動のときだけ「聞き取れなかった」表現
-      avatar.setExpression(Expression::Sad);
-      delay(1500);
-      avatar.setExpression(Expression::Neutral);
+    // 謝るのは「人の喋りらしい音声だったのに聞き取れなかった」ときだけ。
+    // 物音 (声成分が短い) や掃除機・音楽などの連続音 (長すぎる) では
+    // 黙って待機に戻る。ボタン起動は意図的な操作なので常に伝える。
+    const bool speech_like = (g_voiced_100ms >= 4 && g_voiced_100ms <= 35);
+    printf("[REC] voiced=%d x100ms -> %s\n", g_voiced_100ms,
+           speech_like ? "喋りらしい" : "物音/連続音");
+    if (!require_wake || (wake_mode == 2 && speech_like)) {
+      g_reply_expression = Expression::Sad;
+      speech_text = "ごめん、うまく聞き取れなかったよ";
     }
     return;
   }
@@ -1577,10 +1706,10 @@ void listen_and_chat(bool require_wake) {
         speakBlocking("なあに？");
         ret = SpeechToText();
         if (ret == "" || isWhisperHallucination(ret)) {
+          // 呼びかけ済み = こちらに話しかけているのは確実なので返事する
           showFaceState(FACE_IDLE);
-          avatar.setExpression(Expression::Sad);
-          delay(1500);
-          avatar.setExpression(Expression::Neutral);
+          g_reply_expression = Expression::Sad;
+          speech_text = "ごめん、うまく聞き取れなかったよ";
           return;
         }
         printf("音声認識結果(2): %s\n", ret.c_str());
@@ -1641,7 +1770,11 @@ bool vad_triggered() {
     log_peak = 0;
     log_at = millis();
   }
-  const bool is_loud = (peak >= vad_threshold);
+  // サーボ動作音「ジジッ」での誤トリガ防止: 首振り(キョロキョロ)の最中と
+  // その後0.4秒は「大きい音」として数えない (音声自体は履歴に残るので、
+  // 首振り中に話しかけられても動作が収まり次第プリロール付きで拾える)
+  const bool servo_noise = head::movedRecently(400);
+  const bool is_loud = !servo_noise && (peak >= vad_threshold);
   loud_cnt += (is_loud ? 1 : 0) - (recent[rpos] ? 1 : 0);
   recent[rpos] = is_loud;
   rpos = (rpos + 1) % kWinChunks;
@@ -1782,6 +1915,8 @@ void setup() {
 
   delay(1000);
 
+  last_activity_ms = millis();  // おやすみタイマーの起点
+
   // 起動あいさつ (スピーカー/鍵の動作確認を兼ねる)
   g_reply_expression = Expression::Happy;
   String first_wake = WAKE_PHRASE;
@@ -1799,11 +1934,18 @@ void loop() {
     startConfigPortal();  // 戻らない
   }
 
-  // 画面クリック -> 呼びかけ無しですぐ聞く
+  // 画面クリック -> 呼びかけ無しですぐ聞く (眠っていたら起こす)
   if (M5.BtnA.wasClicked() && !mp3->isRunning() &&
       speech_text == "" && speech_text_buffer == "") {
+    if (sleeping) {
+      sleeping = false;
+      head::focus(false);
+      avatar.setExpression(Expression::Neutral);
+    }
+    last_activity_ms = millis();
     sw_tone();
     listen_and_chat(false);
+    head::focus(false);
   }
 
   // タイマー満了 → 会話や再生と重ならないタイミングでアナウンス
@@ -1817,6 +1959,11 @@ void loop() {
 
   // 返答があれば読み上げ開始
   if (speech_text != "") {
+    if (sleeping) {  // タイマー満了など、喋る = 目が覚める
+      sleeping = false;
+      head::focus(false);
+    }
+    last_activity_ms = millis();
     showFaceState(FACE_IDLE);
     avatar.setExpression(g_reply_expression);
     speech_text_buffer = speech_text;
@@ -1824,6 +1971,17 @@ void loop() {
     M5.Mic.end();
     M5.Speaker.begin();
     Voicevox_tts((char*)speech_text_buffer.c_str(), (char*)TTS_PARMS.c_str());
+    if (!mp3->isRunning()) {
+      // TTS開始失敗 (URL取得失敗/接続失敗)。ここで後始末しないと
+      // speech_text_buffer が残り続け、以後ずっと busy 扱いになって
+      // 呼びかけ・ボタン・タイマーが再起動まで一切効かなくなる
+      printf("[TTS] 再生を開始できず。スキップして待機に戻ります\n");
+      stopPlayback();
+      speech_text_buffer = "";
+      avatar.setExpression(Expression::Neutral);
+      delay(200);
+      M5.Speaker.end();
+    }
   }
 
   if (mp3->isRunning()) {
@@ -1840,11 +1998,37 @@ void loop() {
     delay(1);
   } else {
     server.handleClient();
+
+    // 3分以上会話が無ければ眠る (眠い顔 + サーボ停止)。声やボタンで起きる
+    if (!sleeping && speech_text == "" && speech_text_buffer == "" &&
+        millis() - last_activity_ms > kSleepAfterMs) {
+      sleeping = true;
+      printf("[SLEEP] おやすみ...\n");
+      avatar.setExpression(Expression::Sleepy);
+      head::focus(true);   // キョロキョロ停止 + 脱力
+      prepareWakeVoice();  // 暇なうちに起床ボイスをキャッシュしておく
+    }
+
     // 呼びかけ待ち: 音量トリガ -> Whisper -> 呼びかけワード照合
     if (wake_enable && speech_text == "" && speech_text_buffer == "") {
       if (vad_triggered()) {
         printf("[VAD] triggered\n");
-        listen_and_chat(true);
+        if (sleeping) {
+          // 眠りから起こされた: 聞き取りはせず、まず飛び起きる
+          sleeping = false;
+          head::focus(false);
+          g_reply_expression = Expression::Happy;
+          avatar.setExpression(Expression::Happy);
+          printf("[SLEEP] 起きた！\n");
+          if (!speakFromSPIFFS(kWakeVoicePath)) {
+            speakBlocking(kWakeUpSpeech);  // キャッシュが無ければ通常TTS
+          }
+          avatar.setExpression(Expression::Neutral);
+          last_activity_ms = millis();
+        } else {
+          listen_and_chat(true);
+          head::focus(false);
+        }
       }
     }
     delay(1);  // アイドル時に他タスクへ譲る (Task WDT対策)

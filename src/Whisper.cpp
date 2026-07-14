@@ -2,16 +2,22 @@
 #include "Whisper.h"
 
 namespace {
-constexpr char* API_HOST = "api.openai.com";
+constexpr const char* API_HOST = "api.openai.com";
 constexpr int API_PORT = 443;
-constexpr char* API_PATH = "/v1/audio/transcriptions";
+constexpr const char* API_PATH = "/v1/audio/transcriptions";
 }  // namespace
 
 Whisper::Whisper(const char* root_ca, const char* api_key) : client(), key(api_key) {
   client.setCACert(root_ca);
-  client.setTimeout(10000); 
+  client.setTimeout(10000);
   if (!client.connect(API_HOST, API_PORT)) {
-    Serial.println("Connection failed!");
+    // 長時間アイドル後などに一度目が失敗することがあるので1回だけ再試行
+    Serial.println("Connection failed! retrying...");
+    client.stop();
+    delay(200);
+    if (!client.connect(API_HOST, API_PORT)) {
+      Serial.println("Connection failed!");
+    }
   }
 }
 
@@ -20,6 +26,11 @@ Whisper::~Whisper() {
 }
 
 String Whisper::Transcribe(AudioWhisper* audio) {
+  if (!client.connected()) {
+    // 接続失敗のまま送信すると応答待ちタイムアウトまで無言で固まるので即諦める
+    Serial.println("[whisper] not connected. skip transcribe");
+    return "";
+  }
   char boundary[64] = "------------------------";
   for (auto i = 0; i < 2; ++i) {
     ltoa(random(0x7fffffff), boundary + strlen(boundary), 16);
@@ -59,25 +70,38 @@ String Whisper::Transcribe(AudioWhisper* audio) {
   client.print(footer.c_str());
   client.flush();
 
-  // wait response
+  // wait response (delayを挟まないと待機中CPU100%で発熱する)
   const auto now = ::millis();
   while (client.available() == 0) {
     if (::millis() - now > 10000) {
       Serial.println(">>> Client Timeout !");
       return "";
     }
+    if (!client.connected()) {
+      Serial.println(">>> Connection closed before response");
+      return "";
+    }
+    delay(5);
   }
 
-  bool isBody = false;
-  String body = "";
-  while(client.available()){
-    const auto line = client.readStringUntil('\r');
-    if (isBody) {
-      body += line;
-    } else if (line.equals("\n")) {
-      isBody = true;
+  // 応答全体を受信する。available()==0 の瞬間があっても本文途中で打ち切らない
+  // よう、JSON終端 (}) か切断か1.2秒無通信まで待つ。
+  // (旧実装の readStringUntil は最終行で終端文字を1秒待つビジーループになっていた)
+  String resp = "";
+  uint32_t lastData = ::millis();
+  while (::millis() - lastData < 1200) {
+    bool got = false;
+    while (client.available()) {
+      resp += (char)client.read();
+      got = true;
     }
+    if (got) lastData = ::millis();
+    if (resp.endsWith("}")) break;  // 本文(JSON)の終端まで受信済み
+    if (!client.connected() && client.available() == 0) break;
+    delay(5);
   }
+  const int hdrEnd = resp.indexOf("\r\n\r\n");
+  String body = (hdrEnd >= 0) ? resp.substring(hdrEnd + 4) : String("");
 
   StaticJsonDocument<200> doc;
   ::deserializeJson(doc, body);

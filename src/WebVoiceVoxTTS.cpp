@@ -1,5 +1,6 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <SPIFFS.h>
 #include <ArduinoJson.h>
 #include "WebVoiceVoxRootCA.h"
 #include <AudioGeneratorMP3.h>
@@ -147,7 +148,8 @@ bool voicevox_wait_audio_ready(const char* status_url, const char* root_ca, uint
         }
       }
     }
-    delay(100);
+    // https_get は毎回TLSハンドシェイク(CPU重)なのでポーリング間隔は控えめに
+    delay(300);
   }
   Serial.println("voicevox status: wait timeout");
   return false;
@@ -276,4 +278,40 @@ void Voicevox_tts(char *text,char *tts_parms){
   buff = new AudioFileSourceBuffer(file, preallocateBuffer, preallocateBufferSize);
 //  mp3->begin(buff, &out);
   playMP3(buff);
+}
+
+bool Voicevox_tts_download(const char* text, const char* tts_parms, const char* path) {
+  String tts_url = String("https://api.tts.quest/v3/voicevox/synthesis?key=") + VOICEVOX_API_KEY +
+                   String("&text=") + URLEncode(text) + String(tts_parms);
+  String URL = voicevox_tts_url(tts_url.c_str(), root_ca);
+  if (URL == "") return false;
+  if (!SPIFFS.begin(true)) return false;
+
+  bool ok = false;
+  WiFiClientSecure *client = new WiFiClientSecure;
+  if (client) {
+    client->setCACert(root_ca);
+    {
+      HTTPClient https;
+      https.setTimeout(15000);
+      if (https.begin(*client, URL)) {
+        int code = https.GET();
+        if (code == HTTP_CODE_OK) {
+          File f = SPIFFS.open(path, "w");
+          if (f) {
+            int written = https.writeToStream(&f);
+            f.close();
+            ok = (written > 0);
+            if (!ok) SPIFFS.remove(path);  // 中途半端なファイルを残さない
+            Serial.printf("[TTS] cache %s: %d bytes\n", path, written);
+          }
+        } else {
+          Serial.printf("[TTS] cache download failed: HTTP %d\n", code);
+        }
+        https.end();
+      }
+    }
+    delete client;
+  }
+  return ok;
 }

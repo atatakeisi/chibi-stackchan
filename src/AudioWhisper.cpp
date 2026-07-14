@@ -11,12 +11,16 @@ constexpr int headerSize = 44;
 AudioWhisper::AudioWhisper() {
   const auto size = record_size * sizeof(int16_t) + headerSize;
   record_buffer = static_cast<byte*>(::heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (record_buffer == nullptr) {
+    wav_size = 0;
+    return;
+  }
   ::memset(record_buffer, 0, size);
   wav_size = size;
 }
 
 AudioWhisper::~AudioWhisper() {
-  delete record_buffer;
+  ::heap_caps_free(record_buffer);  // malloc確保なので delete ではなく free
 }
 
 size_t AudioWhisper::GetSize() const {
@@ -74,6 +78,7 @@ int16_t* MakeHeader(byte* header, size_t sampleCount) {
 }
 
 void AudioWhisper::Record(const int16_t* preroll, size_t prerollSamples, int silenceStopPeak) {
+  if (record_buffer == nullptr) return;  // PSRAM確保失敗時は何もしない
   M5.Mic.begin();
   auto *wavData = reinterpret_cast<int16_t*>(&record_buffer[headerSize]);
   size_t offset = 0;
