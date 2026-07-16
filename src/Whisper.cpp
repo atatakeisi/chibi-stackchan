@@ -12,11 +12,11 @@ Whisper::Whisper(const char* root_ca, const char* api_key) : client(), key(api_k
   client.setTimeout(10000);
   if (!client.connect(API_HOST, API_PORT)) {
     // 長時間アイドル後などに一度目が失敗することがあるので1回だけ再試行
-    Serial.println("Connection failed! retrying...");
+    printf("[whisper] connection failed! retrying...\n");
     client.stop();
     delay(200);
     if (!client.connect(API_HOST, API_PORT)) {
-      Serial.println("Connection failed!");
+      printf("[whisper] connection failed!\n");
     }
   }
 }
@@ -26,9 +26,11 @@ Whisper::~Whisper() {
 }
 
 String Whisper::Transcribe(AudioWhisper* audio) {
+  net_error = false;
   if (!client.connected()) {
     // 接続失敗のまま送信すると応答待ちタイムアウトまで無言で固まるので即諦める
-    Serial.println("[whisper] not connected. skip transcribe");
+    printf("[whisper] not connected. skip transcribe\n");
+    net_error = true;
     return "";
   }
   char boundary[64] = "------------------------";
@@ -74,11 +76,13 @@ String Whisper::Transcribe(AudioWhisper* audio) {
   const auto now = ::millis();
   while (client.available() == 0) {
     if (::millis() - now > 10000) {
-      Serial.println(">>> Client Timeout !");
+      printf("[whisper] response timeout\n");
+      net_error = true;
       return "";
     }
     if (!client.connected()) {
-      Serial.println(">>> Connection closed before response");
+      printf("[whisper] connection closed before response\n");
+      net_error = true;
       return "";
     }
     delay(5);
@@ -102,8 +106,25 @@ String Whisper::Transcribe(AudioWhisper* audio) {
   }
   const int hdrEnd = resp.indexOf("\r\n\r\n");
   String body = (hdrEnd >= 0) ? resp.substring(hdrEnd + 4) : String("");
+  if (body == "") {
+    printf("[whisper] empty/invalid response\n");
+    net_error = true;
+    return "";
+  }
 
-  StaticJsonDocument<200> doc;
-  ::deserializeJson(doc, body);
+  // NOTE: 旧実装は 200 バイト固定バッファで、長い認識結果だと NoMemory で
+  // 解析に失敗し空文字(=無音扱い)になっていた。長文の発話も受けられる大きさに
+  DynamicJsonDocument doc(4096);
+  if (::deserializeJson(doc, body) != DeserializationError::Ok) {
+    printf("[whisper] JSON parse failed: %s\n", body.substring(0, 120).c_str());
+    net_error = true;
+    return "";
+  }
+  if (!doc["text"].is<const char*>()) {
+    // {"error":{...}} などのAPIエラー応答
+    printf("[whisper] API error: %s\n", body.substring(0, 200).c_str());
+    net_error = true;
+    return "";
+  }
   return doc["text"].as<String>();
 }

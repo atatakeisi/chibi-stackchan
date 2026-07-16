@@ -29,35 +29,35 @@ String https_get(const char* url, const char* root_ca) {
       // Add a scoping block for HTTPClient https to make sure it is destroyed before WiFiClientSecure *client is 
       HTTPClient https;
   
-      Serial.print("[HTTPS] begin...\n");
+      printf("[HTTPS] begin...\n");
       if (https.begin(*client, url)) {  // HTTPS
 //      if (https.begin(*client, "https://api.tts.quest/v1/voicevox/?text=こんにちは世界！)) {  // HTTPS
 //      if (https.begin(*client, "https://jigsaw.w3.org/HTTP/connection.html")) {  // HTTPS&speaker=1"
-        Serial.print("[HTTPS] GET...\n");
+        printf("[HTTPS] GET...\n");
         // start connection and send HTTP header
         int httpCode = https.GET();
   
         // httpCode will be negative on error
         if (httpCode > 0) {
           // HTTP header has been send and Server response header has been handled
-          Serial.printf("[HTTPS] GET... code: %d\n", httpCode);
+          printf("[HTTPS] GET... code: %d\n", httpCode);
   
           // file found at server
           if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_MOVED_PERMANENTLY) {
             payload = https.getString();
           }
         } else {
-          Serial.printf("[HTTPS] GET... failed, error: %s\n", https.errorToString(httpCode).c_str());
+          printf("[HTTPS] GET... failed, error: %s\n", https.errorToString(httpCode).c_str());
         }  
         https.end();
       } else {
-        Serial.printf("[HTTPS] Unable to connect\n");
+        printf("[HTTPS] Unable to connect\n");
       }
       // End extra scoping block
     }  
     delete client;
   } else {
-    Serial.println("Unable to create client");
+    printf("Unable to create client\n");
   }
   return payload;
 }
@@ -73,7 +73,7 @@ String https_post_json(const char* url, const char* json_string, const char* roo
       HTTPClient https;
       https.setTimeout( 25000 ); 
   
-      Serial.print("[HTTPS] begin...\n");
+      printf("[HTTPS] begin...\n");
       if (https.begin(*client, url)) {  // HTTPS
         Serial.print("[HTTPS] POST...\n");
         // start connection and send HTTP header
@@ -97,13 +97,13 @@ String https_post_json(const char* url, const char* json_string, const char* roo
         }  
         https.end();
       } else {
-        Serial.printf("[HTTPS] Unable to connect\n");
+        printf("[HTTPS] Unable to connect\n");
       }
       // End extra scoping block
     }  
     delete client;
   } else {
-    Serial.println("Unable to create client");
+    printf("Unable to create client\n");
   }
   return payload;
 }
@@ -113,13 +113,13 @@ bool voicevox_tts_json_status(const char* url, const char* json_key, const char*
   DynamicJsonDocument doc(1000);
   String payload = https_get(url, root_ca);
   if(payload != ""){
-    Serial.println(payload);
+    printf("%s\n", payload.c_str());
  //    StaticJsonDocument<1000> doc;
 //    JsonObject object = doc.as();
     DeserializationError error = deserializeJson(doc, payload.c_str());
     if (error) {
-      Serial.print(F("deserializeJson() failed: "));
-      Serial.println(error.f_str());
+      printf("deserializeJson() failed: ");
+      printf("%s\n", error.f_str());
       return json_data;
     }
     json_data = doc[json_key];
@@ -139,11 +139,11 @@ bool voicevox_wait_audio_ready(const char* status_url, const char* root_ca, uint
         bool isAudioError = doc["isAudioError"] | false;
         bool isAudioReady = doc["isAudioReady"] | false;
         if (isAudioError) {
-          Serial.println("voicevox status: isAudioError=true");
+          printf("voicevox status: isAudioError=true\n");
           return false;
         }
         if (isAudioReady) {
-          Serial.println("voicevox status: isAudioReady=true");
+          printf("voicevox status: isAudioReady=true\n");
           return true;
         }
       }
@@ -151,7 +151,7 @@ bool voicevox_wait_audio_ready(const char* status_url, const char* root_ca, uint
     // https_get は毎回TLSハンドシェイク(CPU重)なのでポーリング間隔は控えめに
     delay(300);
   }
-  Serial.println("voicevox status: wait timeout");
+  printf("voicevox status: wait timeout (\u9577\u3059\u304e\u308b\u6587\u306f\u5408\u6210\u306b\u6642\u9593\u304c\u304b\u304b\u308b)\n");
   return false;
 }
 
@@ -165,49 +165,50 @@ String voicevox_tts_url(const char* url, const char* root_ca) {
       // Add a scoping block for HTTPClient https to make sure it is destroyed before WiFiClientSecure *client is 
       HTTPClient https;
   
-      Serial.print("[HTTPS] begin...\n");
+      printf("[HTTPS] begin...\n");
       if (https.begin(*client, url)) {  // HTTPS
-        Serial.print("[HTTPS] GET...\n");
+        printf("[HTTPS] GET...\n");
         // start connection and send HTTP header
         int httpCode = https.GET();
   
         // httpCode will be negative on error
         if (httpCode > 0) {
           // HTTP header has been send and Server response header has been handled
-          Serial.printf("[HTTPS] GET... code: %d\n", httpCode);
+          printf("[HTTPS] GET... code: %d\n", httpCode);
   
           // file found at server
           if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_MOVED_PERMANENTLY) {
             String payload = https.getString();
-            Serial.println(payload);
+            printf("%s\n", payload.c_str());
             //StaticJsonDocument<1000> doc;
             DynamicJsonDocument doc(1024);
             DeserializationError error = deserializeJson(doc, payload.c_str());
             if (error) {
-              Serial.print(F("deserializeJson() failed: "));
-              Serial.println(error.f_str());
+              printf("deserializeJson() failed: ");
+              printf("%s\n", error.f_str());
               return tts_url;
             }
   String json_string;
   serializeJsonPretty(doc, json_string);
-  Serial.println("====================");
-  Serial.println(json_string);
-  Serial.println("====================");
+  printf("====================\n");
+  printf("%s\n", json_string.c_str());
+  printf("====================\n");
 
             if(!doc["success"]) return tts_url;
             const char* status_url = doc["audioStatusUrl"];
             if (status_url && strlen(status_url) > 0) {
-              voicevox_wait_audio_ready(status_url, root_ca, 12000);
+              // 長い文は合成に時間がかかる (12秒では足りないことがあった)
+              voicevox_wait_audio_ready(status_url, root_ca, 20000);
             }
 
             const char* mp3url = doc["mp3DownloadUrl"];
             if (!mp3url || strlen(mp3url) == 0) {
               mp3url = doc["mp3StreamingUrl"];
             }
-            Serial.println(mp3url);
-            Serial.print("isApiKeyValid:");
-            if(doc["isApiKeyValid"]) Serial.println("OK");
-            else Serial.println("NG");
+            printf("mp3url: %s\n", mp3url ? mp3url : "(\u306a\u3057)");
+            printf("isApiKeyValid:");
+            if(doc["isApiKeyValid"]) printf("OK\n");
+            else printf("NG (\u30dd\u30a4\u30f3\u30c8\u5207\u308c/\u30ad\u30fc\u4e0d\u6b63\u306e\u53ef\u80fd\u6027)\n");
             if (mp3url) {
               tts_url = String(mp3url);
             }
@@ -219,17 +220,17 @@ String voicevox_tts_url(const char* url, const char* root_ca) {
             // while(!voicevox_tts_json_status(status_url, "isAudioReady", root_ca)) delay(1);
           }
         } else {
-          Serial.printf("[HTTPS] GET... failed, error: %s\n", https.errorToString(httpCode).c_str());
+          printf("[HTTPS] GET... failed, error: %s\n", https.errorToString(httpCode).c_str());
         }  
         https.end();
       } else {
-        Serial.printf("[HTTPS] Unable to connect\n");
+        printf("[HTTPS] Unable to connect\n");
       }
       // End extra scoping block
     }  
     delete client;
   } else {
-    Serial.println("Unable to create client");
+    printf("Unable to create client\n");
   }
   return tts_url;
 }

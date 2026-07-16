@@ -123,6 +123,10 @@ static const char kTimerTagRule[] =
     "タイマーを頼まれたら返答の最後に [timer:秒数] を付けてください (例: 3分なら [timer:180])。"
     "タイマーの中止を頼まれたら [timer:cancel] を、残り時間を聞かれたら [timer:status] を付けてください。"
     "タイマーと関係ない話ではこれらのタグを付けないでください。";
+// 返答は音声合成(VoiceVox Web API)で読み上げるため、長文だと合成に時間がかかり
+// タイムアウトやAPIポイントの浪費につながる。ロールに関わらず長さの上限を自動追記する
+static const char kSpeechLengthRule[] =
+    "返答は音声で読み上げられます。話し言葉で120文字以内に収めてください。";
 
 // タイマー ([timer:秒] タグでセット、満了時に読み上げ)
 uint32_t timer_end_ms = 0;    // 0 = 未設定
@@ -146,7 +150,8 @@ void applyRole(const String& roleText) {
   JsonArray messages = chat_doc["messages"];
   JsonObject m = messages.createNestedObject();
   m["role"] = "system";
-  m["content"] = roleText + "\n" + kExpressionTagRule + "\n" + kTimerTagRule;
+  m["content"] = roleText + "\n" + kExpressionTagRule + "\n" + kTimerTagRule +
+                 "\n" + kSpeechLengthRule;
   InitBuffer = "";
   serializeJson(chat_doc, InitBuffer);
 }
@@ -266,6 +271,7 @@ static const char CONFIG_HTML[] PROGMEM = R"KEWL(
  small{color:#888}
 </style></head><body>
 <h1>ちびスタックちゃん 設定</h1>
+<p><a style="color:#7fb0ff" href="/">&larr; メニューへ戻る</a></p>
 <form onsubmit="save(event)">
  <div class="card">
   <b>Wi-Fi (2.4GHz のみ)</b>
@@ -273,13 +279,19 @@ static const char CONFIG_HTML[] PROGMEM = R"KEWL(
   <label>パスワード</label><input id="pass" name="pass" type="password">
  </div>
  <div class="card">
-  <b>APIキー</b><br><small>空欄の項目は変更されません。</small>
-  <label>Gemini API Key (会話)</label><input id="gemini" name="gemini">
-  <label>Claude API Key (会話をClaudeにする場合)</label><input id="claude" name="claude">
-  <label>会話AI (現在: {{provider}})</label>
-  <select id="provider"><option value="">(変更しない)</option><option value="gemini">Gemini</option><option value="claude">Claude</option></select>
-  <label>OpenAI API Key (音声認識 Whisper)</label><input id="openai" name="openai">
-  <label>VoiceVox API Key (音声合成)</label><input id="voicevox" name="voicevox">
+  <b>&#9888;&#65039; APIキー (重要設定)</b><br>
+  <small style="color:#e6b34d">この子が聞いたり喋ったりするための鍵です。<b>通常は変更不要です。</b><br>
+  間違ったキーを保存すると喋らなくなります。</small>
+  <details style="margin-top:10px">
+   <summary style="cursor:pointer;color:#7fb0ff;padding:6px 0">自分のAPIキーに変更する (取得済みの人向け)</summary>
+   <small>空欄の項目は変更されません。保存時に確認が表示されます。</small>
+   <label>Gemini API Key (会話)</label><input id="gemini" name="gemini">
+   <label>Claude API Key (会話をClaudeにする場合)</label><input id="claude" name="claude">
+   <label>会話AI (現在: {{provider}})</label>
+   <select id="provider"><option value="">(変更しない)</option><option value="gemini">Gemini</option><option value="claude">Claude</option></select>
+   <label>OpenAI API Key (音声認識 Whisper)</label><input id="openai" name="openai">
+   <label>VoiceVox API Key (音声合成)</label><input id="voicevox" name="voicevox">
+  </details>
  </div>
  <div class="card">
   <b>呼びかけ (ウェイクワード)</b>
@@ -372,19 +384,23 @@ static const char CONFIG_HTML[] PROGMEM = R"KEWL(
  document.getElementById("speaker").value="{{speaker}}";
  function save(e){
   e.preventDefault();
+  const danger=["gemini","claude","openai","voicevox","provider"].some(id=>document.getElementById(id).value!=="");
+  if(danger && !confirm("APIキー(重要設定)を変更しようとしています。\n\n・新しいAPIキーは取得してありますか？\n・キーの管理(残高や有効期限)はできていますか？\n\n不用意な変更は動作不能につながります。\nこのまま保存してよいですか？")) return;
   const f=new FormData();
   for(const id of ["ssid","pass","gemini","claude","provider","openai","voicevox","wake","wake_en","vad","speaker","volume","mic","place","lat","lon"]){
    const v=document.getElementById(id).value;
    if(v!=="") f.append(id,v);
   }
   fetch("/wifi_set",{method:"POST",body:f}).then(r=>r.text()).then(t=>{
-   document.body.innerHTML="<h1>保存しました</h1><p>再起動します。数秒後にWi-Fiへ接続します。</p>";
+   document.body.innerHTML="<h1>保存しました</h1><p>再起動します。数秒後にWi-Fiへ接続します。</p>"+
+    "<p><a style='color:#7fb0ff;font-size:17px' href='/'>&larr; メニューへ戻る（再起動が終わる10秒後くらいにどうぞ）</a></p>";
   });
  }
  function clearKeys(){
-  if(!confirm("Wi-Fi情報とAPIキーをすべて消去します。よろしいですか？"))return;
+  if(!confirm("⚠️ Wi-Fi情報とAPIキーをすべて消去します。\n\n消去すると、APIキーを再入力するまで一切動かなくなります。\nキーを再入力できる人 (持ち主) だけが実行してください。\n\n本当に消去しますか？"))return;
   fetch("/clear_keys",{method:"POST"}).then(r=>r.text()).then(t=>{
-   document.body.innerHTML="<h1>消去しました</h1><p>再起動して設定モード(AP)で立ち上がります。</p>";
+   document.body.innerHTML="<h1>消去しました</h1><p>再起動して設定モード(AP)で立ち上がります。<br>"+
+    "Wi-Fi「ChibiStackChan-Setup」(パスワード: stackchan) に接続して http://192.168.4.1 を開いてください。</p>";
   });
  }
 </script>
@@ -399,6 +415,7 @@ textarea{width:100%;height:200px;font-size:15px;background:#222;color:#fff;borde
 button{font-size:17px;padding:12px 18px;margin-top:12px;border:0;border-radius:10px;background:#2d6cff;color:#fff}</style>
 </head><body>
 <h1>ロール設定</h1>
+<p><a style="color:#7fb0ff" href="/">&larr; メニューへ戻る</a></p>
 <p>キャラ設定(システムプロンプト)を入力。空で送ると既定に戻ります。<br>
 <span style="color:#e6b34d">感情タグ・タイマータグのルールは自動で追記されます (書かなくてOK)。</span></p>
 <form onsubmit="postData(event)">
@@ -418,12 +435,21 @@ function postData(e){
 
 void handle_config();  // forward (handleNotFound から使う)
 
+// 結果表示などの簡易ページ。必ず「メニューへ戻る」リンクを付ける
+static String htmlPage(const String& inner) {
+  return String(HEAD_HTML) +
+    "<body style=\"font-family:sans-serif;background:#111;color:#eee;padding:18px;"
+    "font-size:17px;line-height:1.9\">" + inner +
+    "<p style=\"margin-top:24px\"><a style=\"color:#7fb0ff;font-size:17px\" href=\"/\">"
+    "&larr; メニューへ戻る</a></p></body></html>";
+}
+
 void handleNotFound() {
   if (portal_mode) {  // ポータル中はどのURLでも設定ページへ (captive-portal風)
     handle_config();
     return;
   }
-  server.send(404, "text/html", String(HEAD_HTML) + "<body>Not Found</body>");
+  server.send(404, "text/html", htmlPage("ページが見つかりません"));
 }
 
 void handle_config() {
@@ -673,6 +699,22 @@ String stripExpressionTag(String s) {
   return s;
 }
 
+// max_tokens で途中で切れた返答を、最後の文末 (。！？) までで切り詰める。
+// 尻切れの文をそのまま読み上げると不自然なため
+String trimToLastSentence(String s) {
+  const char* ends[] = {"。", "！", "？", "!", "?"};
+  int best = -1;
+  for (const char* e : ends) {
+    int i = s.lastIndexOf(e);
+    if (i >= 0) {
+      int end = i + strlen(e);
+      if (end > best) best = end;
+    }
+  }
+  if (best > 0) s = s.substring(0, best);
+  return s;
+}
+
 // 秒数を「◯分◯秒」の読み上げ形式に
 String formatDuration(uint32_t sec) {
   String m = "";
@@ -828,6 +870,11 @@ String chatClaude(String json_string) {
         g_reply_expression = pickExpression(response);
         response = stripExpressionTag(response);
         response = processTimerTag(response);
+        const char* stop = doc["stop_reason"];
+        if (stop && strcmp(stop, "max_tokens") == 0) {
+          response = trimToLastSentence(response);
+          printf("[AI] max_tokensで途切れたため文末まで切り詰め\n");
+        }
       } else {
         response = "わかりません";
       }
@@ -880,6 +927,11 @@ String chatGemini(String json_string) {
         g_reply_expression = pickExpression(response);
         response = stripExpressionTag(response);
         response = processTimerTag(response);
+        const char* finish = doc["candidates"][0]["finishReason"];
+        if (finish && strcmp(finish, "MAX_TOKENS") == 0) {
+          response = trimToLastSentence(response);
+          printf("[AI] max_tokensで途切れたため文末まで切り詰め\n");
+        }
       } else {
         response = "わかりません";
       }
@@ -1057,9 +1109,14 @@ void handle_speech() {
   if (message != "" && speech_text == "" && speech_text_buffer == "") {
     g_reply_expression = Expression::Happy;
     speech_text = message;
-    server.send(200, "text/plain", "OK");
+    String safe = message;
+    safe.replace("<", "&lt;");
+    server.send(200, "text/html", htmlPage("しゃべります: " + safe));
+  } else if (message == "") {
+    server.send(200, "text/html", htmlPage("say パラメータがありません"));
   } else {
-    server.send(200, "text/plain", "busy");
+    server.send(200, "text/html",
+                htmlPage("いま再生・処理中みたいです。少し待ってからもう一度どうぞ"));
   }
 }
 
@@ -1075,9 +1132,14 @@ void handle_chat() {
   } else if (speech_text == "" && speech_text_buffer == "") {
     response = exec_chat(text);
   } else {
-    response = "busy";
+    response = "いま再生・処理中みたいです。少し待ってからもう一度どうぞ";
   }
-  server.send(200, "text/html", String(HEAD_HTML) + "<body>" + response + "</body>");
+  String safe = response;
+  safe.replace("<", "&lt;");
+  server.send(200, "text/html", htmlPage(safe +
+    "<form action=\"/chat\" style=\"margin-top:18px\">"
+    "<input name=\"text\" placeholder=\"続けて質問する\" style=\"font-size:16px;padding:8px\">"
+    "<button style=\"font-size:16px;padding:8px\">送信</button></form>"));
 }
 
 void handle_face() {
@@ -1085,7 +1147,7 @@ void handle_face() {
   int idx = expression.toInt();
   const int n = sizeof(expressions_table) / sizeof(expressions_table[0]);
   if (idx >= 0 && idx < n) avatar.setExpression(expressions_table[idx]);
-  server.send(200, "text/plain", "OK");
+  server.send(200, "text/html", htmlPage("表情を変えました"));
 }
 
 void handle_setting() {
@@ -1120,7 +1182,7 @@ void handle_setting() {
     M5.Speaker.setVolume(volume);
     M5.Speaker.setChannelVolume(m5spk_virtual_channel, volume);
   }
-  server.send(200, "text/plain", "OK");
+  server.send(200, "text/html", htmlPage("設定を反映しました"));
 }
 
 bool save_json() {
@@ -1436,6 +1498,8 @@ void showFaceState(FaceState s) {
 // 人の発話ならおおむね4〜35窓 (0.4〜3.5秒) に収まる。
 // 物音は短すぎ、掃除機・音楽などの連続音は長すぎるので除外できる。
 int g_voiced_100ms = 0;
+// 直近の音声認識が通信/APIエラーだったか (false で空文字なら無音・物音)
+bool g_stt_net_error = false;
 
 String SpeechToText(bool use_preroll = false) {
   printf("Record start!%s\n", use_preroll ? " (プリロール付き)" : "");
@@ -1488,6 +1552,7 @@ String SpeechToText(bool use_preroll = false) {
   avatar.setExpression(Expression::Doubt);  // 認識中
   Whisper* stt = new Whisper(root_ca_openai, OPENAI_API_KEY.c_str());
   String ret = stt->Transcribe(audio);
+  g_stt_net_error = stt->hadNetworkError();
   delete stt;
   delete audio;
   avatar.setExpression(Expression::Neutral);
@@ -1669,13 +1734,15 @@ void listen_and_chat(bool require_wake) {
     if (ret != "") printf("音声認識: 幻聴とみなし無視 [%s]\n", ret.c_str());
     else printf("音声認識: 空文字 (無音/認識失敗)\n");
     showFaceState(FACE_IDLE);
-    // 謝るのは「人の喋りらしい音声だったのに聞き取れなかった」ときだけ。
-    // 物音 (声成分が短い) や掃除機・音楽などの連続音 (長すぎる) では
-    // 黙って待機に戻る。ボタン起動は意図的な操作なので常に伝える。
-    const bool speech_like = (g_voiced_100ms >= 4 && g_voiced_100ms <= 35);
-    printf("[REC] voiced=%d x100ms -> %s\n", g_voiced_100ms,
-           speech_like ? "喋りらしい" : "物音/連続音");
-    if (!require_wake || (wake_mode == 2 && speech_like)) {
+    // Whisperが正常に処理して空だった = 物音や無音なので黙って待機に戻る。
+    // 謝るのは通信/APIエラーで本当に聞き取れなかったときと、
+    // ボタン起動 (意図的な操作) のときだけ。
+    // ※音として認識できた物音 (「【電子レンジの音】」等) は文字として返って
+    //   くるためここには来ず、なんでも返事モードならAIが反応する (仕様)
+    printf("[REC] voiced=%d x100ms, 通信エラー=%s -> %s\n", g_voiced_100ms,
+           g_stt_net_error ? "あり" : "なし",
+           (!require_wake || g_stt_net_error) ? "返事する" : "無視");
+    if (!require_wake || (wake_mode == 2 && g_stt_net_error)) {
       g_reply_expression = Expression::Sad;
       speech_text = "ごめん、うまく聞き取れなかったよ";
     }
