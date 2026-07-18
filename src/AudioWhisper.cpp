@@ -1,11 +1,14 @@
 #include <M5Unified.h>
 #include "AudioWhisper.h"
 
-// 最大6秒 (無音検出で早期打ち切りされるので通常はもっと短い)
-constexpr size_t record_number = 640;
-constexpr size_t record_length = 150;
-constexpr size_t record_size = record_number * record_length;
+// 最大12秒 (喋り終わりの無音2秒で早期打ち切りされるので通常はもっと短い。
+//  この上限は長い発話が尻切れになるのを防ぐ保険で、普段の挙動には影響しない。
+//  人が一息で話す長さはほぼ12秒以内。これ以上長くすると誤トリガ時の拘束時間と
+//  発話後のWhisper送信待ちが延びるだけで得るものが少ない)
 constexpr size_t record_samplerate = 16000;
+constexpr size_t record_max_sec = 12;
+constexpr size_t record_size = record_samplerate * record_max_sec;
+constexpr size_t record_length = 150;
 constexpr int headerSize = 44;
 
 AudioWhisper::AudioWhisper() {
@@ -87,10 +90,13 @@ void AudioWhisper::Record(const int16_t* preroll, size_t prerollSamples, int sil
     ::memcpy(wavData, preroll, prerollSamples * sizeof(int16_t));
     offset = prerollSamples;
   }
-  // 発話終了検出: 一度声が入った後、silenceStopPeak 未満が 1.5 秒続いたら打ち切る。
+  // 発話終了検出: 一度声が入った後、silenceStopPeak 未満が 2.0 秒続いたら打ち切る。
   // (短い呼びかけ+長い無音を Whisper に送ると幻聴になるため。
-  //  1.5 秒は息継ぎや文中の間で切れない程度の余裕)
-  const int stop_chunks = (int)(1.5f * record_samplerate / record_length);
+  //  2.0 秒は息継ぎや文中の間で切れない程度の余裕)
+  // NOTE: silenceStopPeak には VAD 起動しきい値より低い値を渡すこと。
+  // 起動用の高いしきい値をそのまま使うと、声が小さくなる文末を無音と
+  // 誤認して発話の途中で切れる (実機で 6 秒前後で切れる症状の原因だった)
+  const int stop_chunks = (int)(2.0f * record_samplerate / record_length);
   bool voice_seen = (prerollSamples > 0);  // プリロール有 = トリガ済みの声がある
   int silent_run = 0;
   while (offset + record_length <= record_size) {

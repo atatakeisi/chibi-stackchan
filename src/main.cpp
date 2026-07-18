@@ -1505,13 +1505,17 @@ String SpeechToText(bool use_preroll = false) {
   printf("Record start!%s\n", use_preroll ? " (プリロール付き)" : "");
   showFaceState(FACE_LISTENING);
   AudioWhisper* audio = new AudioWhisper();
+  // 録音終了判定のしきい値は起動トリガ(vad_threshold)より低くする。
+  // 「起こす」には大きな声が必要だが、「まだ喋っているか」の判定に同じ値を
+  // 使うと、声が小さくなる文末を無音と誤認して途中で録音が切れるため
+  const int stop_peak = max(1000, vad_threshold / 3);
   size_t pre_n = 0;
   if (use_preroll && vad_hist_count > 0) {
     static int16_t preroll_copy[kPreRollChunks * kVadChunkSamples];
     pre_n = vadHistoryCopy(preroll_copy);
-    audio->Record(preroll_copy, pre_n, vad_threshold);
+    audio->Record(preroll_copy, pre_n, stop_peak);
   } else {
-    audio->Record(nullptr, 0, vad_threshold);
+    audio->Record(nullptr, 0, stop_peak);
   }
   showFaceState(FACE_THINKING);
   if (audio->GetBuffer() == nullptr || audio->GetSize() <= 44) {
