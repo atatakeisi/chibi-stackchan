@@ -1027,9 +1027,19 @@ bool tryLocalTimerCommand(const String& text) {
 }
 
 String exec_chat(String text) {
-  // ローカルコマンド: IPアドレス読み上げ (画面表示が小さくて読めない時用)
-  if (text.indexOf("アイピー") >= 0 || text.indexOf("IPアドレス") >= 0 ||
-      text.indexOf("IP アドレス") >= 0) {
+  // ローカルコマンド: IPアドレス読み上げ (画面表示が小さくて読めない時用)。
+  // Whisper は「アイピー」を "IP" とアルファベットで書き起こすことが多いため、
+  // 表記ゆれ (アイピー/あいぴー/IP/ip) を広めに拾う
+  String lower = text;
+  lower.toLowerCase();  // ASCII のみ小文字化 (日本語はそのまま)
+  const bool mentionsIp = text.indexOf("アイピー") >= 0 ||
+                          text.indexOf("あいぴー") >= 0 ||
+                          lower.indexOf("ip") >= 0;
+  const bool asksIp = mentionsIp &&
+      (text.indexOf("アドレス") >= 0 || text.indexOf("教え") >= 0 ||
+       text.indexOf("何") >= 0 || text.indexOf("なに") >= 0 ||
+       text.indexOf("いくつ") >= 0);
+  if (asksIp) {
     String ip = WiFi.localIP().toString();
     ip.replace(".", "、てん、");
     g_reply_expression = Expression::Happy;
