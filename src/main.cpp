@@ -271,6 +271,7 @@ static const char CONFIG_HTML[] PROGMEM = R"KEWL(
  button.danger{background:#c0392b}
  small{color:#888}
 </style></head><body>
+{{mode}}
 <h1>ちびスタックちゃん 設定</h1>
 <p><a style="color:#7fb0ff" href="/">&larr; メニューへ戻る</a></p>
 <form onsubmit="save(event)">
@@ -407,6 +408,59 @@ static const char CONFIG_HTML[] PROGMEM = R"KEWL(
 </script>
 </body></html>)KEWL";
 
+// 設定モード(APポータル)専用のシンプル画面。初めて使う人が「今どっちの設定を
+// しているのか」「何を入力すればよいのか」で迷わないよう、Wi-Fi の2項目だけに絞る。
+// 持ち主が鍵情報クリア後にAPIキーを入れ直す場合は末尾のリンクから全設定を開ける
+static const char SETUP_HTML[] PROGMEM = R"KEWL(
+<!DOCTYPE html><html lang="ja"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ちびスタックちゃん はじめの設定</title><style>
+ body{font-family:sans-serif;background:#111;color:#eee;margin:0;padding:18px}
+ .badge{background:#dc6e00;color:#fff;font-weight:bold;padding:11px 14px;border-radius:8px;
+        max-width:480px;box-sizing:border-box}
+ h1{font-size:22px;margin:18px 0 6px} p{color:#bbb;line-height:1.7}
+ .card{background:#1d1d22;border-radius:12px;padding:16px;margin:14px 0;max-width:480px}
+ label{display:block;font-size:14px;color:#aaa;margin-top:12px}
+ input{width:100%;box-sizing:border-box;font-size:17px;padding:12px;border-radius:8px;
+       border:1px solid #444;background:#222;color:#fff}
+ button{font-size:18px;padding:16px 18px;margin-top:18px;border:0;border-radius:10px;
+        background:#2d6cff;color:#fff;width:100%;max-width:480px;display:block}
+ small{color:#888} a{color:#7fb0ff}
+</style></head><body>
+<div class="badge">&#128295; SETUP MODE / はじめの設定</div>
+<h1>Wi-Fi につなぐ</h1>
+<p>ちびスタックちゃんを、おうちの Wi-Fi につなぎます。<br>
+入力するのは、下の<b>2つだけ</b>です。</p>
+<form onsubmit="save(event)">
+ <div class="card">
+  <label>Wi-Fi の名前 (SSID)</label>
+  <input id="ssid" required placeholder="例: aterm-a1b2c3-g">
+  <label>Wi-Fi のパスワード</label>
+  <input id="pass" type="password">
+  <p><small>&#9888;&#65039; <b>2.4GHz</b> の Wi-Fi のみ対応です。名前の最後が
+  「-a」「-5g」などの5GHz用にはつながりません。</small></p>
+ </div>
+ <button type="submit">保存してつなぐ</button>
+</form>
+<p style="margin-top:22px"><small>音量・声・キャラなどの設定は、つながったあとに
+できます。<br><br><a href="/wifi?full=1">すべての設定を表示（持ち主向け）</a></small></p>
+<script>
+ function save(e){
+  e.preventDefault();
+  const f=new FormData();
+  f.append("ssid",document.getElementById("ssid").value);
+  f.append("pass",document.getElementById("pass").value);
+  fetch("/wifi_set",{method:"POST",body:f}).then(r=>r.text()).then(t=>{
+   document.body.innerHTML="<h1>保存しました</h1>"+
+    "<p>再起動して Wi-Fi につなぎます。<br>"+
+    "スマホの Wi-Fi を、<b>おうちの Wi-Fi に戻してください</b>。</p>"+
+    "<p>うまくつながると、10秒ほどで「こんにちは」と挨拶します。<br>"+
+    "挨拶しないときは、入力し直してもう一度お試しください。</p>";
+  });
+ }
+</script>
+</body></html>)KEWL";
+
 static const char ROLE_HTML[] PROGMEM = R"KEWL(
 <!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -454,7 +508,22 @@ void handleNotFound() {
 }
 
 void handle_config() {
+  // 設定モード(AP)中は Wi-Fi 入力だけの簡易画面を出す。
+  // 通常時の設定画面と見分けが付かず、初めての人が迷うのを防ぐため。
+  // 持ち主が全項目を触りたいときは /wifi?full=1 で従来の画面を開ける
+  if (portal_mode && !server.hasArg("full")) {
+    server.send(200, "text/html", SETUP_HTML);
+    return;
+  }
   String html = FPSTR(CONFIG_HTML);
+  // いまどちらのモードで開いているかを最上部に明示する
+  html.replace("{{mode}}", portal_mode
+      ? "<div style=\"background:#dc6e00;color:#fff;font-weight:bold;padding:11px 14px;"
+        "border-radius:8px;max-width:480px;box-sizing:border-box\">"
+        "&#128295; SETUP MODE（設定モードで接続中）</div>"
+      : "<div style=\"background:#16301c;color:#8fd89f;padding:11px 14px;border-radius:8px;"
+        "max-width:480px;box-sizing:border-box\">"
+        "&#9989; 通常モード（おうちの Wi-Fi に接続中）</div>");
   html.replace("{{ssid}}", CFG_WIFI_SSID == "" ? "(未設定)" : CFG_WIFI_SSID);
   html.replace("{{provider}}", AI_PROVIDER == "claude" ? "Claude" : "Gemini");
   html.replace("{{wake}}", WAKE_PHRASE);
