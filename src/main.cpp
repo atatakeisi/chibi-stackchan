@@ -399,7 +399,7 @@ static const char CONFIG_HTML[] PROGMEM = R"KEWL(
   });
  }
  function clearKeys(){
-  if(!confirm("⚠️ Wi-Fi情報とAPIキーをすべて消去します。\n\n消去すると、APIキーを再入力するまで一切動かなくなります。\nキーを再入力できる人 (持ち主) だけが実行してください。\n\n本当に消去しますか？"))return;
+  if(!confirm("⚠️ Wi-Fi情報とAPIキーをすべて消去します。\n\n消去すると、APIキーを再入力するまで一切動かなくなります。\nキーを再入力できる人 (APIキー管理者) だけが実行してください。\n\n本当に消去しますか？"))return;
   fetch("/clear_keys",{method:"POST"}).then(r=>r.text()).then(t=>{
    document.body.innerHTML="<h1>消去しました</h1><p>再起動して設定モード(AP)で立ち上がります。<br>"+
     "Wi-Fi「ChibiStackChan-Setup」(パスワード: stackchan) に接続して http://192.168.4.1 を開いてください。</p>";
@@ -410,7 +410,7 @@ static const char CONFIG_HTML[] PROGMEM = R"KEWL(
 
 // 設定モード(APポータル)専用のシンプル画面。初めて使う人が「今どっちの設定を
 // しているのか」「何を入力すればよいのか」で迷わないよう、Wi-Fi の2項目だけに絞る。
-// 持ち主が鍵情報クリア後にAPIキーを入れ直す場合は末尾のリンクから全設定を開ける
+// APIキー管理者が鍵情報クリア後にキーを入れ直す場合は末尾のリンクから全設定を開ける
 static const char SETUP_HTML[] PROGMEM = R"KEWL(
 <!DOCTYPE html><html lang="ja"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -443,7 +443,7 @@ static const char SETUP_HTML[] PROGMEM = R"KEWL(
  <button type="submit">保存してつなぐ</button>
 </form>
 <p style="margin-top:22px"><small>音量・声・キャラなどの設定は、つながったあとに
-できます。<br><br><a href="/wifi?full=1">すべての設定を表示（持ち主向け）</a></small></p>
+できます。<br><br><a href="/wifi?full=1">すべての設定を表示（APIキー管理者向け）</a></small></p>
 <script>
  function save(e){
   e.preventDefault();
@@ -510,7 +510,7 @@ void handleNotFound() {
 void handle_config() {
   // 設定モード(AP)中は Wi-Fi 入力だけの簡易画面を出す。
   // 通常時の設定画面と見分けが付かず、初めての人が迷うのを防ぐため。
-  // 持ち主が全項目を触りたいときは /wifi?full=1 で従来の画面を開ける
+  // APIキー管理者が全項目を触りたいときは /wifi?full=1 で従来の画面を開ける
   if (portal_mode && !server.hasArg("full")) {
     server.send(200, "text/html", SETUP_HTML);
     return;
