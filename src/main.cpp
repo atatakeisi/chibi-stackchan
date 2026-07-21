@@ -98,6 +98,7 @@ String TTS_SPEAKER = "&speaker=";
 String TTS_PARMS = TTS_SPEAKER + TTS_SPEAKER_NO;
 
 bool portal_mode = false;      // AP設定ポータル動作中か
+bool avatar_ready = false;     // avatar.init() 済みか (描画タスクが動いているか)
 //---------------------------------------------
 
 static const char HEAD_HTML[] PROGMEM = R"KEWL(
@@ -1409,6 +1410,24 @@ void servo(void *args) {
 void startConfigPortal() {
   portal_mode = true;
   server.stop();
+
+  // アバターの描画タスクは10msごとに顔を描き直すため、止めずに案内を描くと
+  // すぐ顔で上書きされてしまう (長押しが効いていないように見える原因だった)
+  if (avatar_ready) {
+    avatar.suspend();
+    delay(50);  // 描画途中のフレームが残らないよう少し待つ
+  }
+  head::focus(true);  // 設定中はサーボを正面で止めておく
+
+  // 設定モードに入ったことを音でも知らせる (画面を見ていなくても分かるように)
+  M5.Mic.end();
+  M5.Speaker.begin();
+  M5.Speaker.tone(880, 120);
+  delay(160);
+  M5.Speaker.tone(1320, 220);
+  delay(300);
+  M5.Speaker.end();
+
   WiFi.disconnect(true);
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_AP);
@@ -1417,21 +1436,41 @@ void startConfigPortal() {
   Serial.printf("[CFG] AP mode: SSID=ChibiStackChan-Setup pass=stackchan  http://%s\n",
                 ip.toString().c_str());
 
-  // 128x128 の小画面向け案内表示
+  // 128x128 の小画面向け案内表示。一目で「設定モードだ」と分かるように
+  // 上部にタイトルバーを敷く
+  const uint16_t kBarColor = M5.Lcd.color565(220, 110, 0);
   M5.Lcd.fillScreen(TFT_BLACK);
+  M5.Lcd.fillRect(0, 0, 128, 20, kBarColor);
+  M5.Lcd.setTextSize(2);
+  M5.Lcd.setTextColor(TFT_WHITE, kBarColor);
+  M5.Lcd.setCursor(3, 2);
+  M5.Lcd.print("SETUP MODE");
+
   M5.Lcd.setTextSize(1);
-  M5.Lcd.setCursor(0, 4);
-  M5.Lcd.setTextColor(TFT_YELLOW);
-  M5.Lcd.println(" WiFi SETUP MODE");
-  M5.Lcd.setTextColor(TFT_WHITE);
-  M5.Lcd.println("");
-  M5.Lcd.println(" 1) connect WiFi:");
-  M5.Lcd.println("  ChibiStackChan");
-  M5.Lcd.println("  -Setup");
-  M5.Lcd.println("  pass: stackchan");
-  M5.Lcd.println("");
-  M5.Lcd.println(" 2) open browser:");
-  M5.Lcd.printf("  http://%s\n", ip.toString().c_str());
+  M5.Lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
+  M5.Lcd.setCursor(2, 26);
+  M5.Lcd.print("1) Connect WiFi");
+  M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+  M5.Lcd.setCursor(8, 38);
+  M5.Lcd.print("ChibiStackChan");
+  M5.Lcd.setCursor(8, 47);
+  M5.Lcd.print("-Setup");
+  M5.Lcd.setCursor(8, 56);
+  M5.Lcd.print("pass: stackchan");
+
+  M5.Lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
+  M5.Lcd.setCursor(2, 72);
+  M5.Lcd.print("2) Open browser");
+  M5.Lcd.setTextColor(TFT_CYAN, TFT_BLACK);
+  M5.Lcd.setCursor(8, 84);
+  M5.Lcd.printf("http://%s", ip.toString().c_str());
+
+  M5.Lcd.drawFastHLine(0, 100, 128, M5.Lcd.color565(70, 70, 70));
+  M5.Lcd.setTextColor(M5.Lcd.color565(150, 150, 150), TFT_BLACK);
+  M5.Lcd.setCursor(2, 106);
+  M5.Lcd.print("Save -> auto reboot");
+  M5.Lcd.setCursor(2, 116);
+  M5.Lcd.print("Quit = unplug USB");
 
   registerRoutes();
   server.begin();
@@ -1991,6 +2030,7 @@ void setup() {
   avatar.setScale(0.4);         // 320x240 -> 128x128 に合わせて縮小
   avatar.setPosition(-56, -96); // 縮小した顔を画面中央へ
   avatar.init();
+  avatar_ready = true;
   avatar.addTask(lipSync, "lipSync");
   avatar.addTask(servo, "servo");
 
