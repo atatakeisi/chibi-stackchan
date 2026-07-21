@@ -1487,6 +1487,31 @@ void Wifi_setup() {
   }
   Serial.printf("[WiFi] connecting to '%s'\n", CFG_WIFI_SSID.c_str());
   WiFi.begin(CFG_WIFI_SSID.c_str(), CFG_WIFI_PASS.c_str());
+
+  // 接続中の案内。渡した相手の家では前の持ち主のSSIDが見つからず15秒待つことに
+  // なるため、「画面を押せば設定に入れる」ことを画面上でも知らせる
+  M5.Lcd.fillScreen(TFT_BLACK);
+  M5.Lcd.setTextSize(1);
+  M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+  M5.Lcd.setCursor(2, 4);
+  M5.Lcd.print("Connecting WiFi");
+  M5.Lcd.setTextColor(TFT_CYAN, TFT_BLACK);
+  M5.Lcd.setCursor(2, 16);
+  M5.Lcd.printf("%.20s", CFG_WIFI_SSID.c_str());
+  M5.Lcd.drawFastHLine(0, 60, 128, M5.Lcd.color565(70, 70, 70));
+  M5.Lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
+  M5.Lcd.setCursor(2, 68);
+  M5.Lcd.print("Press screen 1s");
+  M5.Lcd.setCursor(2, 78);
+  M5.Lcd.print("-> WiFi SETUP");
+  M5.Lcd.setTextColor(M5.Lcd.color565(150, 150, 150), TFT_BLACK);
+  M5.Lcd.setCursor(2, 100);
+  M5.Lcd.print("or wait 15s for");
+  M5.Lcd.setCursor(2, 110);
+  M5.Lcd.print("auto setup mode");
+  M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+  M5.Lcd.setCursor(2, 34);  // 以降の "." はここから並ぶ
+
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED) {
     M5.Lcd.print(".");
@@ -1976,9 +2001,7 @@ void setup() {
     startConfigPortal();  // 戻らない
   }
 
-  M5.Lcd.print("WiFi");
-  Wifi_setup();
-  M5.Lcd.println("OK");
+  Wifi_setup();  // 画面表示は Wifi_setup() 側で行う
 
   wc::beginClock();  // NTP (JST)
 
